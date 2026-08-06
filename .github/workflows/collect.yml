@@ -1,0 +1,57 @@
+# Scrape merchant.vubavuba.rw and push normalized orders to the resto-ledger
+# Worker, which notifies the kitchen for today's new orders (auto mode).
+#
+# WHY EVERY 5 MINUTES AND NOT 2: five is GitHub's hard floor for scheduled
+# workflows, and real-world delivery is 5-15 minutes because schedules are
+# queued, not exact. This is the free-tier compromise the owner chose over an
+# always-on machine. The Vubavuba merchant app on the restaurant's phone remains
+# the instant alert; this pipeline is what books the order and backstops the
+# kitchen ticket.
+#
+# WHY THE REPO IS PUBLIC: private repos meter Actions minutes (2,000/month —
+# a 5-minute schedule burns ~4x that); public repos are unmetered. Nothing
+# secret lives in the code: credentials arrive only through Actions secrets,
+# and the collector redacts them from its own logs.
+name: collect
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+# One run at a time. Every write is an idempotent upsert, so an overlap would
+# not corrupt anything — it would just hammer the portal twice for nothing.
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run collector
+        env:
+          VUBAVUBA_USERNAME: ${{ secrets.VUBAVUBA_USERNAME }}
+          VUBAVUBA_PASSWORD: ${{ secrets.VUBAVUBA_PASSWORD }}
+          LEDGER_API_BASE: ${{ secrets.LEDGER_API_BASE }}
+          COLLECTOR_TOKEN: ${{ secrets.COLLECTOR_TOKEN }}
+        # The collector reads a chmod-600 env FILE (its laptop heritage — it
+        # refuses looser permissions). Written via Python, not shell
+        # interpolation, so a password containing $, %, or backticks survives.
+        run: |
+          python - <<'PY'
+          import os, pathlib
+          d = pathlib.Path.home() / ".config" / "resto-ledger"
+          d.mkdir(parents=True, exist_ok=True)
+          f = d / "collector.env"
+          keys = ["VUBAVUBA_USERNAME", "VUBAVUBA_PASSWORD", "LEDGER_API_BASE", "COLLECTOR_TOKEN"]
+          f.write_text("".join(f"{k}={os.environ[k]}\n" for k in keys) + "WINDOW_DAYS=3\n")
+          f.chmod(0o600)
+          PY
+          python vubavuba_collector.py
