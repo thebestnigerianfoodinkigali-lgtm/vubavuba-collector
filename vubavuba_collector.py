@@ -21,6 +21,19 @@ drift guard caught the change on its first run and refused to import anything,
 which is exactly what it is for. So this program now asks for the JSON directly:
 it is the same data one hop earlier, without a browser in the middle.
 
+TWO WAYS TO RUN IT, AND WHY THE SECOND ONE EXISTS (`--watch`, 2026-08-07). Bare,
+this is a one-shot: log in, read the window, POST, exit — which is what the
+launchd agent and the GitHub Actions backstop run, and what everything below
+describes unless it says otherwise. `--watch` is the same program with the
+sleeping done on the inside: it logs in ONCE, then re-reads the recent window
+every ten seconds on that one session and imports only when the payload actually
+changed. The owner wants an order in the kitchen within ten seconds of it being
+placed, and the arithmetic is what forces the shape. A one-shot every ten seconds
+is 8,640 logins a day against somebody's merchant account — a login flood that
+looks exactly like credential stuffing, and the account it endangers is the
+restaurant's. Ten-second polls on one session is a merchant watching their own
+dashboard, which is what the portal is for.
+
 WHAT THIS PROGRAM PROMISES
 
   * It never guesses. Money that does not parse, a row whose column count
@@ -53,15 +66,18 @@ USAGE
     uv run --project collector vubavuba-collect --dry-run  # print, do not POST
     uv run --project collector vubavuba-collect --full     # backfill from 2026-01-01
     uv run --project collector vubavuba-collect --capture-fixtures
+    uv run --project collector vubavuba-collect --watch    # one login, poll every 10s
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import re
+import signal
 import stat
 import sys
 import time
@@ -240,6 +256,45 @@ HISTORY_START = date(2026, 1, 1)
 ACTIVE_HOUR_FROM = 7
 ACTIVE_HOUR_TO = 23
 
+#: `--watch`: how often to re-read the window, and the floor under it. Ten
+#: seconds is the freshness the owner asked for; the floor is there because
+#: `WATCH_POLL_SECONDS=1` in a config file is a typo away and this is somebody
+#: else's production server. Both are seconds.
+#:
+#: It is the GAP between polls, not a period: the request itself and the
+#: one-per-second courtesy throttle add a second or two on top, so ten here is a
+#: new order noticed within about twelve seconds and usually half that. Somebody
+#: who wants the ten to be a ceiling sets this to 5.
+WATCH_POLL_SECONDS = 10.0
+WATCH_POLL_FLOOR = 5.0
+
+#: `--watch` backoff after a failed poll: 15s, doubling, never longer than five
+#: minutes. THE CAP IS THE POINT. A portal that goes down at 19:00 must not be
+#: met by a program that keeps knocking every ten seconds until morning — at the
+#: cap it is twelve attempts an hour (and at most two login POSTs each, in the
+#: one case where the failure IS the authentication), which is a patient client
+#: rather than a login storm, and it still recovers within five minutes of the
+#: portal coming back. Backing off is also strictly gentler than exiting: the
+#: phone's supervisor restarts a dead collector in 30 seconds, forever.
+WATCH_BACKOFF_START = 15.0
+WATCH_BACKOFF_MAX = 300.0
+
+#: `--watch`: re-read the WHOLE window this often even when the digest says
+#: nothing moved. See `watch` — this is what makes the one-page poll safe on a
+#: window that no longer fits in one page.
+WATCH_SWEEP_SECONDS = 900.0
+
+#: `--watch`: one line to say the loop is alive, this often. Anything more
+#: frequent is 8,640 lines a day of "still nothing", which is how a log becomes
+#: a thing nobody greps.
+WATCH_HEARTBEAT_SECONDS = 3600.0
+
+#: `--watch`: the longest a sleep may ignore a signal. Every wait in watch mode
+#: is chopped into pieces this size, because PEP 475 makes `time.sleep` RESUME
+#: after a handler returns — an eight-hour night sleep would swallow the SIGTERM
+#: that was meant to stop it, and the operator would be left holding Ctrl-C.
+WATCH_SLEEP_CHUNK = 5.0
+
 DEFAULT_ENV_FILE = Path.home() / ".config" / "resto-ledger" / "collector.env"
 DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "resto-ledger"
 
@@ -259,6 +314,8 @@ class Config:
     collector_token: str
     window_days: int = 3
     portal_base: str = PORTAL_BASE
+    #: `--watch` only. Ignored by every one-shot run.
+    watch_poll_seconds: float = WATCH_POLL_SECONDS
 
     @property
     def secrets(self) -> tuple[str, ...]:
@@ -335,6 +392,26 @@ def load_config(path: Path = DEFAULT_ENV_FILE) -> Config:
     if not 1 <= window_days <= 365:
         raise ConfigError(f"WINDOW_DAYS must be between 1 and 365, got {window_days}")
 
+    # CLAMPED, NOT REFUSED — the opposite of how WINDOW_DAYS is treated, on
+    # purpose. A wrong WINDOW_DAYS silently changes which orders get imported, so
+    # it stops the run; a wrong poll interval only changes how often we knock, so
+    # the safe value is applied and said out loud. Refusing here would take a
+    # working collector off the air over a number that has a right answer.
+    raw_poll = values.get("WATCH_POLL_SECONDS", "").strip()
+    try:
+        poll_seconds = float(raw_poll) if raw_poll else WATCH_POLL_SECONDS
+    except ValueError:
+        LOG.warning("WATCH_POLL_SECONDS=%r is not a number — using %.0fs", raw_poll, WATCH_POLL_SECONDS)
+        poll_seconds = WATCH_POLL_SECONDS
+    if poll_seconds < WATCH_POLL_FLOOR:
+        LOG.warning(
+            "WATCH_POLL_SECONDS=%s is below the %.0fs floor — polling every %.0fs instead",
+            raw_poll,
+            WATCH_POLL_FLOOR,
+            WATCH_POLL_FLOOR,
+        )
+        poll_seconds = WATCH_POLL_FLOOR
+
     return Config(
         username=values["VUBAVUBA_USERNAME"],
         password=values["VUBAVUBA_PASSWORD"],
@@ -342,6 +419,7 @@ def load_config(path: Path = DEFAULT_ENV_FILE) -> Config:
         collector_token=values["COLLECTOR_TOKEN"],
         window_days=window_days,
         portal_base=(values.get("VUBAVUBA_BASE_URL") or PORTAL_BASE).rstrip("/"),
+        watch_poll_seconds=poll_seconds,
     )
 
 
@@ -1042,6 +1120,27 @@ class Scraped:
     contradictions: int = 0
 
 
+def orders_params(page: int, start: date, end: date) -> dict[str, Any]:
+    """
+    The query `load_orders.php` is asked with — ONE definition, two callers.
+
+    The paging loop below and `--watch`'s poll both ask this endpoint for rows,
+    and they have to ask the same question: a poll that filtered differently from
+    the import would go quiet on exactly the orders the import would have caught.
+    So the shape lives here rather than in two dict literals that agree today.
+    """
+    return {
+        "page": page,
+        "per_page": PER_PAGE,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        # Sent empty, as the portal's own script sends them. An endpoint that
+        # starts requiring them must not be able to fail us quietly.
+        "search": "",
+        "status": "",
+    }
+
+
 def scrape_orders(portal: Portal, start: date, end: date) -> Scraped:
     """
     Page through `api/load_orders.php` for the window and normalize everything.
@@ -1085,19 +1184,7 @@ def scrape_orders(portal: Portal, start: date, end: date) -> Scraped:
                 f"should be. Either the portal keeps serving rows past its own reported total, or the "
                 f"page parameter is being ignored."
             )
-        payload = portal.get_json(
-            ORDERS_API_PATH,
-            {
-                "page": page,
-                "per_page": PER_PAGE,
-                "start_date": start.isoformat(),
-                "end_date": end.isoformat(),
-                # Sent empty, as the portal's own script sends them. An endpoint
-                # that starts requiring them must not be able to fail us quietly.
-                "search": "",
-                "status": "",
-            },
-        )
+        payload = portal.get_json(ORDERS_API_PATH, orders_params(page, start, end))
         if page == 1:
             first_payload = payload
 
@@ -1448,6 +1535,276 @@ def run(cfg: Config, args: argparse.Namespace, portal: Portal | None = None) -> 
     return summary
 
 
+# ---------------------------------------------------------------------------
+# Watch mode — one login, a poll every ten seconds
+# ---------------------------------------------------------------------------
+
+
+def poll_digest(payload: Any) -> str:
+    """
+    A `load_orders.php` page → a fingerprint that changes when the ORDERS do.
+
+    This is the whole economy of watch mode. Ten-second polling only earns its
+    keep if the expensive half — page through the window, normalize, POST it to
+    the ledger — happens when something actually moved, and a hash of the rows is
+    a cheaper answer to "did anything move" than parsing them is.
+
+    IT IS THE ROWS AND THE COUNTS, NOT THE WHOLE PAYLOAD. `ordersHtml` carries
+    every field the ledger stores, INCLUDING the status badge — which matters
+    because a status change (`pending` → `successful`) is a change this loop must
+    notice, and it is the only kind that leaves the row count alone.
+    `pagination` is folded in as the second witness: it catches an order arriving
+    or vanishing on a page we are not looking at. `paginationHtml` is left out
+    deliberately — it is a rendered widget, and a portal that restyles it would
+    otherwise re-import the window on every poll forever.
+
+    A payload this function cannot recognise is hashed whole rather than refused.
+    Digesting is not validating: whatever came back, the job here is only to tell
+    it apart from what came back last time, and the guards in
+    `parse_orders_json` are what get to have an opinion about its shape.
+    """
+    if not isinstance(payload, dict):
+        return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+    pagination = payload.get("pagination")
+    parts = [str(payload.get("success")), str(payload.get("ordersHtml") or "")]
+    if isinstance(pagination, dict):
+        parts.extend(f"{key}={pagination.get(key)!r}" for key in PAGINATION_KEYS)
+    else:
+        parts.append(repr(pagination))
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
+
+
+def seconds_until_active(now: datetime | None = None) -> float:
+    """
+    How long until 07:00 Kigali — `0.0` if the restaurant is open right now.
+
+    The one-shot answers "the restaurant is shut" by exiting 0 and letting
+    launchd call again in two hours. A daemon cannot do that: exiting is how it
+    stops existing. So the night is a sleep, and this is the arithmetic behind
+    it. `ACTIVE_HOUR_TO` is inclusive — hour 23 is open, because 23:40 is a
+    perfectly ordinary time for the last delivery of the evening to be paid for.
+    """
+    now = now or kigali_now()
+    if ACTIVE_HOUR_FROM <= now.hour <= ACTIVE_HOUR_TO:
+        return 0.0
+    opening = now.replace(hour=ACTIVE_HOUR_FROM, minute=0, second=0, microsecond=0)
+    if opening <= now:
+        opening += timedelta(days=1)
+    return (opening - now).total_seconds()
+
+
+def _duration(seconds: float) -> str:
+    """`27000.0` → `"7h 30m"`. For the one line a human reads at 23:00."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes = int(seconds // 60)
+    return f"{minutes}m" if minutes < 60 else f"{minutes // 60}h {minutes % 60:02d}m"
+
+
+class WatchStop:
+    """
+    The flag SIGINT and SIGTERM set, and the only clean way out of the loop.
+
+    A signal handler must not do the stopping itself. It fires between two
+    bytecodes — possibly in the middle of a POST that the ledger is already
+    committing — and a handler that raised there would leave the run half
+    reported. This records that somebody asked, and the loop reads it at the next
+    point where nothing is in flight.
+    """
+
+    def __init__(self) -> None:
+        self.reason = ""
+
+    def set(self, signum: int | None = None, frame: Any = None) -> None:
+        self.reason = signal.Signals(signum).name if signum else "asked to stop"
+
+    def __bool__(self) -> bool:
+        return bool(self.reason)
+
+
+def _watch_sleep(seconds: float, stop: WatchStop, sleeper: Any) -> None:
+    """
+    Sleep, in pieces, so a signal is answered in seconds rather than at dawn.
+
+    PEP 475 made `time.sleep` RESUME after a signal handler returns, which is
+    almost always what you want and is exactly wrong here: `_watch_sleep(27000)`
+    through the night would take the SIGTERM, set the flag, and then go back to
+    sleep for another seven hours with nobody left to notice. Chopping the wait
+    into `WATCH_SLEEP_CHUNK` pieces bounds how long the flag can go unread.
+    """
+    remaining = float(seconds)
+    while remaining > 0 and not stop:
+        nap = min(WATCH_SLEEP_CHUNK, remaining)
+        sleeper(nap)
+        remaining -= nap
+
+
+def watch(
+    cfg: Config,
+    args: argparse.Namespace,
+    portal: Portal | None = None,
+    sleeper: Any = time.sleep,
+    stop: WatchStop | None = None,
+) -> int:
+    """
+    Log in once; re-read the recent window every ~10s; import only what changed.
+
+    WHAT ONE POLL COSTS THE PORTAL: exactly one GET of `api/load_orders.php`,
+    page 1, on the session opened at start-up. At the default ten seconds that is
+    six requests a minute — about 6,100 across a 17-hour trading day — and ONE
+    login, against the 720 logins a day the two-minute one-shot cadence spends
+    now. That is the trade this mode exists to make: many more cheap reads, three
+    orders of magnitude fewer authentications.
+
+    WHY PAGE 1 AND NOT THE WHOLE WINDOW. Page 1 is 100 rows, and this restaurant's
+    three-day window is comfortably inside that, so on any ordinary day page 1 IS
+    the window and its digest is an exact answer. When the window outgrows one
+    page the digest stops being exact — a status moving on a row that has fallen
+    onto page 2 would not show up in it — and rather than reason about a sort
+    order the portal has never promised us, `WATCH_SWEEP_SECONDS` re-reads the
+    whole window on a timer regardless of the digest. So the fast path is cheap
+    and the slow path is complete, and the failure mode of the cheap one is
+    bounded at fifteen minutes instead of forever.
+
+    WHAT A CHANGE TRIGGERS: `run` — the same function the one-shot calls, with the
+    same pagination, the same drift guards, the same idempotent upserts, and the
+    same one summary line. Watch mode adds a trigger, not a second importer. It
+    costs one extra fetch of page 1 (the poll's copy is a fingerprint, not an
+    import), which is a request every few minutes against not having two code
+    paths that can disagree about what an order is.
+
+    WHY IT DOES NOT EXIT ON FAILURE. Every failure here is met with a capped
+    exponential backoff instead of an exit code, because the thing that would
+    "restart" it — the phone's supervisor, launchd — restarts it in 30 seconds,
+    forever, and a program that dies every 30 seconds against a portal that is
+    down is the login storm this whole design exists to avoid. Drift is the one
+    that needs saying twice: a payload this program cannot parse is dumped, is
+    logged as loudly as ever, and is then REMEMBERED BY DIGEST, so a portal that
+    has genuinely changed shape is retried on the sweep timer rather than on
+    every poll — a few dumps an hour instead of one every ten seconds, until the
+    human they are addressed to reads one. Nothing is imported from any of them.
+    """
+    stop = stop if stop is not None else WatchStop()
+    portal = portal or Portal(cfg)
+    poll_seconds = max(WATCH_POLL_FLOOR, float(cfg.watch_poll_seconds))
+
+    logged_in = False
+    digest: str | None = None
+    backoff = WATCH_BACKOFF_START
+    polls = 0
+    failures = 0
+    last_change: datetime | None = None
+    since_heartbeat = 0.0
+    # Due immediately: the first poll of a session has nothing to compare against
+    # anyway, so it may as well be the complete read.
+    since_sweep = WATCH_SWEEP_SECONDS
+
+    LOG.info(
+        "watch mode: one login, then %s every %.0fs; active %02d:00-%02d:59 Kigali. "
+        "SIGINT or SIGTERM stops it.",
+        ORDERS_API_PATH,
+        poll_seconds,
+        ACTIVE_HOUR_FROM,
+        ACTIVE_HOUR_TO,
+    )
+
+    while not stop:
+        shut_for = seconds_until_active()
+        if shut_for > 0:
+            # ONE line for the whole night, not one per poll. The alternative is
+            # 4,000 lines of "closed" between midnight and seven, which is how
+            # the morning's real messages become unfindable.
+            LOG.info(
+                "the restaurant is shut — sleeping %s, until %02d:00 Kigali",
+                _duration(shut_for),
+                ACTIVE_HOUR_FROM,
+            )
+            _watch_sleep(shut_for, stop, sleeper)
+            # Nothing that happened before the night is worth carrying past it:
+            # open with a complete read and a fresh hour on the heartbeat.
+            since_sweep = WATCH_SWEEP_SECONDS
+            since_heartbeat = 0.0
+            continue
+
+        wait = poll_seconds
+        fresh: str | None = None
+        try:
+            if not logged_in:
+                # ONCE per session. Everything after this rides the cookie, and
+                # the mid-session expiry the portal does on its own schedule is
+                # handled a layer down, inside `get_json`.
+                portal.login()
+                logged_in = True
+
+            start, end = window_for(args, cfg, kigali_now().date())
+            payload = portal.get_json(ORDERS_API_PATH, orders_params(1, start, end))
+            polls += 1
+
+            fresh = poll_digest(payload)
+            changed = fresh != digest
+            due_sweep = since_sweep >= WATCH_SWEEP_SECONDS
+            if changed or due_sweep:
+                if changed:
+                    last_change = kigali_now()
+                else:
+                    LOG.info("watch sweep: re-reading %s..%s even though page 1 has not moved", start, end)
+                # Reset BEFORE the read, not after. The sweep is a timer on how
+                # long the one-page poll may be trusted on its own, and a read
+                # that failed still spent that trust; what decides whether a
+                # failed import is retried is the digest, which is the thing that
+                # knows if anything is outstanding. Resetting afterwards would
+                # mean a drifted portal re-reading, re-failing and re-dumping on
+                # every single poll, because the sweep would never come due.
+                since_sweep = 0.0
+                summary = run(cfg, args, portal)
+                LOG.info("%s", summary.line())
+                digest = fresh
+
+            failures = 0
+            backoff = WATCH_BACKOFF_START
+        except Exception as err:  # noqa: BLE001 - the loop outlives everything below it
+            if isinstance(err, (PortalDrift, PaginationError)) and fresh is not None:
+                # This exact payload has already been dumped and logged. Reading
+                # it again on every poll produces another identical dump and
+                # tells nobody anything they did not know at the first one, so it
+                # drops back to the sweep timer. The next genuine change to the
+                # window gets a fresh look and, if it is still broken, a fresh
+                # dump.
+                digest = fresh
+            if isinstance(err, AuthError):
+                # The session is gone in a way `get_json`'s own re-login could not
+                # fix. Start the next attempt from a clean login rather than from
+                # a cookie we have already watched fail.
+                logged_in = False
+            if isinstance(err, CollectorError):
+                LOG.error("%s", err)
+            else:
+                LOG.exception("unexpected failure in the watch loop: %s", err)
+            failures += 1
+            wait = backoff
+            backoff = min(backoff * 2, WATCH_BACKOFF_MAX)
+            LOG.warning(
+                "backing off %s before the next poll (%d consecutive failure(s))",
+                _duration(wait),
+                failures,
+            )
+
+        since_heartbeat += wait
+        since_sweep += wait
+        if since_heartbeat >= WATCH_HEARTBEAT_SECONDS:
+            LOG.info(
+                "watch alive, %d polls, last change %s",
+                polls,
+                last_change.strftime("%H:%M") if last_change else "none yet",
+            )
+            since_heartbeat = 0.0
+
+        _watch_sleep(wait, stop, sleeper)
+
+    LOG.info("watch stopped (%s) after %d poll(s)", stop.reason, polls)
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="vubavuba-collect",
@@ -1458,6 +1815,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start", help="window start, YYYY-MM-DD (with --end)")
     parser.add_argument("--end", help="window end, YYYY-MM-DD (with --start)")
     parser.add_argument("--force", action="store_true", help="run even outside 07:00-23:00 Kigali")
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="stay running: log in once, re-read the recent window every ~10s, import what changed",
+    )
     parser.add_argument("--capture-fixtures", action="store_true", help="save the raw pages into tests/fixtures/")
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE, help=f"default {DEFAULT_ENV_FILE}")
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR, help=f"default {DEFAULT_STATE_DIR}")
@@ -1487,6 +1849,46 @@ def main(argv: Sequence[str] | None = None) -> int:
     if bool(args.start) != bool(args.end):
         LOG.error("--start and --end must be given together")
         return EXIT_CONFIG
+
+    if args.watch and (args.full or args.capture_fixtures):
+        # Both are one-shot errands with an end — a backfill from January, a
+        # snapshot of today's markup — and neither means anything to a loop that
+        # never finishes. Refusing beats doing the first iteration of a backfill
+        # forever, or overwriting the captured fixtures every ten seconds.
+        LOG.error("--watch is a daemon; it cannot be combined with --full or --capture-fixtures")
+        return EXIT_CONFIG
+
+    if args.watch:
+        stop = WatchStop()
+        # HANDLERS ARE BORROWED, NOT TAKEN. The phone's launcher imports this
+        # module and calls `main` in-process, in a loop, so a SIGTERM handler
+        # left pointing at a WatchStop nobody reads any more would make the whole
+        # app unkillable by the one signal everything uses to ask politely.
+        previous = {}
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                previous[sig] = signal.getsignal(sig)
+                signal.signal(sig, stop.set)
+            except (ValueError, OSError, AttributeError):  # pragma: no cover - not the main thread
+                # Only the main thread may install a handler. Losing the clean
+                # shutdown is not a reason to lose the collector, so this is a
+                # shrug and not an error.
+                previous.pop(sig, None)
+                LOG.debug("could not install a handler for %s", sig)
+        try:
+            return watch(cfg, args, stop=stop)
+        except CollectorError as err:
+            LOG.error("%s", err)
+            return err.exit_code
+        except Exception as err:  # noqa: BLE001 - the same last line of defence the one-shot has
+            LOG.exception("unexpected failure: %s", err)
+            return EXIT_UNEXPECTED
+        finally:
+            for sig, handler in previous.items():
+                try:
+                    signal.signal(sig, handler)
+                except (ValueError, OSError, TypeError):  # pragma: no cover
+                    pass
 
     hour = kigali_now().hour
     if not (args.force or args.full or args.dry_run) and not (ACTIVE_HOUR_FROM <= hour <= ACTIVE_HOUR_TO):

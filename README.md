@@ -13,9 +13,21 @@ code — credentials live only in Actions secrets (`VUBAVUBA_USERNAME`,
 redacts them from its own logs.
 
 **Honest latency:** GitHub's schedule floor is 5 minutes and delivery is
-queued, so real cadence is 5–15 minutes. The Vubavuba merchant app on the
-restaurant phone remains the instant alert; this is the bookkeeping path and
-the kitchen-ticket backstop.
+queued, so real cadence is 5–15 minutes. That is why this is now the *backstop*
+rather than the main path — see below.
+
+**The fast path is `--watch` on the shop's phone.** `phone.py` starts the same
+collector with `--watch` and keeps it running: it logs in **once**, then
+re-reads the recent orders every ten seconds on that one session and books
+whatever changed, so an order reaches the kitchen in about ten seconds instead
+of five to fifteen minutes. The Actions run above stays exactly as it is — a
+one-shot every five minutes, catching anything a phone that was off, flat or
+off the wifi missed. Both write the same idempotent upserts, so they cannot
+double-book each other.
+
+A one-shot every ten seconds would have been 8,640 logins a day against a live
+merchant account; ten-second polls on one session is a merchant watching their
+own dashboard. That distinction is the whole reason watch mode exists.
 
 The collector itself (`vubavuba_collector.py`) is a verbatim copy of
 `resto-ledger/collector/` — fix bugs there first, then copy the file here.
