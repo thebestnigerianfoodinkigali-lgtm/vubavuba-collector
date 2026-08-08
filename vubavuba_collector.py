@@ -21,6 +21,22 @@ drift guard caught the change on its first run and refused to import anything,
 which is exactly what it is for. So this program now asks for the JSON directly:
 it is the same data one hop earlier, without a browser in the middle.
 
+WHERE THE CUSTOMER COMES FROM (2026-08-08). The order list has no customer in it
+— the nearest thing to one is the delivery address — so the name and phone number
+the owner asked for come from a SECOND endpoint, the one behind the portal's own
+**Details** button (`api/order_handler.php?id=…`). It is asked ONLY about orders
+this program has never seen before, which is a handful a day against a window that
+is re-read every ten seconds: `~/.local/state/resto-ledger/customer-details-seen.json`
+is what remembers which those are across restarts. A details fetch that fails
+costs that order its customer and nothing else — the order still imports, and both
+fields are optional all the way through the ledger.
+
+  The split the owner asked for, enforced on the SERVER and written here because
+  this is where the data enters: the ledger app shows the name AND the phone; the
+  Telegram kitchen ticket and counter alert show the NAME ONLY. Nothing in this
+  program decides that, and nothing in it should — it sends both fields and
+  `worker/lib/kitchen.ts` is where the line is drawn.
+
 TWO WAYS TO RUN IT, AND WHY THE SECOND ONE EXISTS (`--watch`, 2026-08-07). Bare,
 this is a one-shot: log in, read the window, POST, exit — which is what the
 launchd agent and the GitHub Actions backstop run, and what everything below
@@ -167,6 +183,19 @@ LOGIN_PAGE_PATH = "/views/auth/login.php"
 #: `Accept: application/json` and the session cookie, and so do we.
 ORDERS_API_PATH = "/api/load_orders.php"
 
+#: WHERE THE CUSTOMER IS (probed 2026-08-08). The order LIST has no customer in
+#: it at all — the nearest thing is the delivery address — so the name and the
+#: phone number the owner asked for come from the endpoint behind the portal's own
+#: **Details** button: `sales-report.php`'s `openOrderModal(id)` fetches this with
+#: the session cookie and renders the modal from it.
+#:
+#: The keys this program reads are three: `first_name`, `last_name`,
+#: `contact_phone`. The response carries a good deal more (`delivery_address`,
+#: `delivery_charge`, `sub_total`, `status`, `json_details`, `comment`, `ebm`, and
+#: an `item_data` array of per-dish rows with quantities, prices, sizes and
+#: add-ons) — see `parse_order_details` for why none of the rest is touched today.
+ORDER_DETAILS_PATH = "/api/order_handler.php"
+
 #: The page a human opens. Nothing is read from it — it is here so that the log
 #: and the RUNBOOK can name the thing the owner sees in a browser.
 REPORT_PAGE_PATH = "/views/sales-report.php"
@@ -251,6 +280,43 @@ ABSOLUTE_MAX_PAGES = 2000
 
 #: `--full` starts here. The store's Vubavuba history does not predate it.
 HISTORY_START = date(2026, 1, 1)
+
+#: THE BUDGET FOR CUSTOMER DETAILS, and the two numbers that bound it.
+#:
+#: One extra GET per NEWLY-SEEN order — never per poll, never for a ref this
+#: collector has already asked about. On an ordinary day that is one request per
+#: order placed, which for this restaurant is a handful; the window is re-read
+#: hundreds of times a day and costs the details endpoint nothing on any of them.
+#:
+#: The cap is not a queue and is not about ordinary days. It is about `--full`,
+#: which first-sees a January-to-today backfill in one run: without a ceiling that
+#: is thousands of sequential requests against somebody's production server, at one
+#: per second, for hours — to fill in the customer of a meal eaten in February,
+#: which nobody is going to ring. Orders past the cap are imported WITHOUT customer
+#: fields and are not retried, and the run says so in its summary line. The fetches
+#: are spent NEWEST FIRST, so the ones that get them are the ones a kitchen ticket
+#: and a phone call are actually about.
+MAX_DETAIL_FETCHES_PER_RUN = 25
+
+#: Where "we have already asked about this ref" is remembered between runs, under
+#: the state directory beside the log and the drift dumps.
+#:
+#: WITHOUT IT THE ONE-SHOT WOULD RE-ASK EVERY TIME. `--watch` is a long-lived
+#: process and could have kept this in memory, but the launchd agent is a fresh
+#: process every two hours reading the same rolling three-day window, so an
+#: in-memory set would mean the whole window's details re-fetched eight times a
+#: day, for ever, for data that cannot change. A small file is the difference
+#: between one request per order and one request per order per run.
+#:
+#: BEST-EFFORT IN BOTH DIRECTIONS. Losing it costs one window's worth of re-asked
+#: details (idempotent, and the ledger's COALESCE means a second answer is harmless);
+#: failing to write it must never fail a run that has already imported.
+KNOWN_REFS_FILE = "customer-details-seen.json"
+
+#: How long a ref stays remembered. Long enough that a `--full` backfill and every
+#: ordinary window are covered, short enough that the file stays a few hundred
+#: lines rather than growing for ever. Pruned by the order's own date on every save.
+KNOWN_REFS_KEEP_DAYS = 30
 
 #: Kigali hours in which a run is worth doing at all.
 ACTIVE_HOUR_FROM = 7
@@ -618,6 +684,10 @@ class PageResult:
     #: `pagination.total_pages` — the portal's own answer to "how many pages".
     total_pages: int = 0
     unknown_payment_types: list[str] = field(default_factory=list)
+    #: `refNo` → the id `order_handler.php` wants, read out of the row's own
+    #: **Details** link. See `detail_id_of`; a row whose link we cannot read is
+    #: simply absent here and gets no customer.
+    detail_ids: dict[str, str] = field(default_factory=dict)
 
 
 def normalize_report_row(cells: Sequence[str], row_no: int) -> tuple[dict[str, Any], str | None]:
@@ -699,6 +769,32 @@ def items_cell_text(cell: Any) -> str:
     return _SPACE_BEFORE_COMMA.sub(",", collapse(cell.get_text(" ")))
 
 
+#: The id inside the row's own **Details** link: `onclick='openOrderModal(2915384)'`.
+#: Quotes are tolerated because a template that starts emitting them has not changed
+#: anything that matters, and refusing over one would cost every customer name.
+_ORDER_MODAL_ID = re.compile(r"openOrderModal\(\s*['\"]?(\d+)['\"]?\s*\)")
+
+
+def detail_id_of(actions_cell: Any) -> str | None:
+    """
+    The id `order_handler.php` wants for this row, or None.
+
+    READ OUT OF THE ROW RATHER THAN ASSUMED. In every response probed so far the
+    id and the Ref# are the same number, and it would be one character cheaper to
+    send the ref. But they are two different fields of somebody else's database
+    that happen to agree, and the failure mode if they ever stop agreeing is not a
+    missing name — it is THE WRONG CUSTOMER'S name and phone number attached to
+    this order, on a kitchen ticket and on the Orders screen. That is not a bug
+    worth risking to save a regex.
+
+    A row whose Actions cell we cannot read gets no detail fetch at all. Returning
+    None is the whole error handling: no customer is the ordinary state of most
+    orders in this ledger, and guessing an id is the one thing that must not happen.
+    """
+    match = _ORDER_MODAL_ID.search(str(actions_cell))
+    return match.group(1) if match else None
+
+
 def status_cell_text(cell: Any, row_no: int) -> str:
     """
     The Status cell → `"successful"`, read out of the badge that marks it.
@@ -721,10 +817,10 @@ def status_cell_text(cell: Any, row_no: int) -> str:
     return collapse(badge.get_text(" "))
 
 
-def parse_orders_rows(orders_html: str) -> tuple[list[dict[str, Any]], list[str]]:
+def parse_orders_rows(orders_html: str) -> tuple[list[dict[str, Any]], list[str], dict[str, str]]:
     """
-    `ordersHtml` (bare `<tr>`s) → normalized orders, plus the payment rails we do
-    not know.
+    `ordersHtml` (bare `<tr>`s) → normalized orders, the payment rails we do not
+    know, and each row's details id.
 
     The fragment is wrapped in a table before parsing: `<tr>` outside a table is
     not valid HTML and a parser is entitled to throw the rows away, which would
@@ -734,6 +830,7 @@ def parse_orders_rows(orders_html: str) -> tuple[list[dict[str, Any]], list[str]
 
     orders: list[dict[str, Any]] = []
     unknown: list[str] = []
+    detail_ids: dict[str, str] = {}
     for row_no, tr in enumerate(soup.find_all("tr"), start=1):
         cells = tr.find_all("td")
         if not cells:
@@ -757,8 +854,13 @@ def parse_orders_rows(orders_html: str) -> tuple[list[dict[str, Any]], list[str]
         orders.append(order)
         if unknown_payment:
             unknown.append(unknown_payment)
+        # Kept beside the order rather than inside it: it is a handle for a second
+        # request, not a field of an order, and it must never reach the POST.
+        detail_id = detail_id_of(cells[COL_ACTIONS])
+        if detail_id is not None:
+            detail_ids[order["refNo"]] = detail_id
 
-    return orders, unknown
+    return orders, unknown, detail_ids
 
 
 def _whole_number(value: Any) -> bool:
@@ -823,12 +925,13 @@ def parse_orders_json(payload: Any) -> PageResult:
             f"{ORDERS_API_PATH}: PORTAL DRIFT — 'ordersHtml' is {type(orders_html).__name__}, not a string"
         )
 
-    orders, unknown = parse_orders_rows(orders_html)
+    orders, unknown, detail_ids = parse_orders_rows(orders_html)
     return PageResult(
         orders=orders,
         total_entries=int(pagination["total_orders"]),
         total_pages=int(pagination["total_pages"]),
         unknown_payment_types=unknown,
+        detail_ids=detail_ids,
     )
 
 
@@ -1053,6 +1156,7 @@ class Portal:
         path: str,
         params: dict[str, Any] | None = None,
         dump_label: str | None = None,
+        dump: bool = True,
     ) -> Any:
         """
         GET a JSON endpoint, logging back in once if the session has aged out.
@@ -1067,6 +1171,15 @@ class Portal:
         name, so a second JSON endpoint added here cannot quietly write its dumps
         under the first one's name — which is exactly the sort of thing that
         wastes twenty minutes at 07:00.
+
+        `dump=False` puts the evidence in the LOG instead of in a file, and exists
+        for the one caller whose failures are survivable. A dump is an unbounded
+        file written per failure; that is exactly right for the orders endpoint,
+        where a failure stops the run and there will be one of them. The details
+        endpoint is asked once per new order and a failure there costs a customer
+        name and nothing else, so a portal that removed it would otherwise leave a
+        dump per order per day, for ever, in a directory nobody prunes. The log
+        rotates at 1 MB × 5 and is where somebody looks anyway.
         """
         label = dump_label or _label_for(path)
         headers = {"Accept": "application/json"}
@@ -1085,21 +1198,21 @@ class Portal:
         body = response.text or ""
         if response.status_code >= 400:
             # Not a session problem — that was ruled out above — and not something
-            # to retry blindly against somebody's production server. Dump it and
-            # stop: whatever this is, a human reading the body is the fast path.
-            dump_drift(body, label, suffix=".txt")
+            # to retry blindly against somebody's production server. Keep the
+            # evidence and stop: whatever this is, a human reading the body is the
+            # fast path.
             raise PortalDrift(
                 f"{path}: PORTAL DRIFT — HTTP {response.status_code} from an endpoint that should "
-                f"answer 200 with orders. This is the portal refusing or failing, not a column that "
-                f"moved; the body is in the dump above."
+                f"answer 200 with JSON. This is the portal refusing or failing, not a column that "
+                f"moved; {_evidence(body, label, dump)}"
             )
         try:
             return response.json()
         except ValueError as err:
-            dump_drift(body, label, suffix=".txt")
             raise PortalDrift(
                 f"{path}: PORTAL DRIFT — the response is not JSON ({err}). "
-                f"content-type was {response.headers.get('content-type')!r}."
+                f"content-type was {response.headers.get('content-type')!r}. "
+                f"{_evidence(body, label, dump)}"
             ) from err
 
 
@@ -1118,6 +1231,9 @@ class Scraped:
     first_page_payload: Any = None
     #: Times the portal reported orders it then declined to hand over.
     contradictions: int = 0
+    #: `refNo` → the id its Details link carries, across every page. See
+    #: `detail_id_of`; a ref missing from here gets no customer fetch.
+    detail_ids: dict[str, str] = field(default_factory=dict)
 
 
 def orders_params(page: int, start: date, end: date) -> dict[str, Any]:
@@ -1167,6 +1283,7 @@ def scrape_orders(portal: Portal, start: date, end: date) -> Scraped:
     long costs one request that returns `No orders found.`
     """
     by_ref: dict[str, dict[str, Any]] = {}
+    detail_ids: dict[str, str] = {}
     unknown: list[str] = []
     duplicates = 0
     contradictions = 0
@@ -1211,6 +1328,7 @@ def scrape_orders(portal: Portal, start: date, end: date) -> Scraped:
             if order["refNo"] in by_ref:
                 duplicates += 1
             by_ref[order["refNo"]] = order
+        detail_ids.update(result.detail_ids)
         unknown.extend(result.unknown_payment_types)
 
         if not result.orders:
@@ -1249,7 +1367,232 @@ def scrape_orders(portal: Portal, start: date, end: date) -> Scraped:
         duplicate_refs=duplicates,
         first_page_payload=first_payload,
         contradictions=contradictions,
+        detail_ids=detail_ids,
     )
+
+
+# ---------------------------------------------------------------------------
+# The customer, from the endpoint behind the portal's own Details button
+# ---------------------------------------------------------------------------
+
+
+def parse_order_details(payload: Any) -> tuple[str | None, str | None]:
+    """
+    One `order_handler.php` response → `(customer_name, customer_phone)`.
+
+    THIS FUNCTION NEVER RAISES, and that is the difference between it and every
+    other parser in this file. The others guard an ORDER — money, a status, a date
+    — where guessing writes a wrong number into a ledger and stopping is the only
+    honest answer. This one guards a name. An order with no customer attached is
+    the ordinary state of every row in this ledger written before 2026-08-08, the
+    app and the ticket both simply print no customer line, and the import is
+    additive: refusing the whole run because a name was missing would trade the
+    restaurant's order sync for a nicety.
+
+    So anything unexpected — not an object, keys absent, a number where a string
+    should be — is `(None, None)`.
+
+    The name is `"first last"` with the whitespace collapsed, because the portal's
+    two fields are what a person typed into a delivery app and routinely carry
+    trailing spaces and double spaces. Either half alone is a name too: `first_name`
+    with no surname is extremely common and is still what a cook calls out.
+
+    WHAT IS DELIBERATELY IGNORED. The response also carries `item_data` — the
+    per-dish rows with quantities, prices, sizes and add-ons that the report's
+    free-text `Item` cell does not have — plus `delivery_address`,
+    `delivery_charge`, `sub_total`, `comment` and `ebm`. All of it is left alone
+    here on purpose: the ledger's item rows come from `items_raw` today, both
+    writers of an order have to agree on the content hash, and quietly switching
+    one of them to a richer source is a change to what an order IS rather than an
+    addition to it. It is written down in the RUNBOOK as a thing that could be done
+    rather than half-done here.
+    """
+    if not isinstance(payload, dict):
+        return None, None
+
+    def text(key: str) -> str:
+        value = payload.get(key)
+        return collapse(value) if isinstance(value, str) else ""
+
+    name = collapse(f"{text('first_name')} {text('last_name')}")
+    phone = text("contact_phone")
+    return (name or None), (phone or None)
+
+
+@dataclass
+class CustomerFetch:
+    """What one run's details fetching did, for the summary line."""
+
+    #: Requests actually made. This IS the extra load on the portal.
+    fetched: int = 0
+    #: Of those, how many came back with a name.
+    found: int = 0
+    #: Fetches that failed or returned nothing usable. Never fails the run.
+    failures: int = 0
+    #: New orders left without a customer because the run hit its cap.
+    over_cap: int = 0
+    #: New orders whose row carried no readable Details link.
+    no_detail_id: int = 0
+    #: The first payload, verbatim, for `--capture-fixtures`.
+    first_payload: Any = None
+
+
+def fetch_customer_details(
+    portal: Portal,
+    orders: Sequence[dict[str, Any]],
+    detail_ids: dict[str, str],
+    known_refs: dict[str, str],
+) -> CustomerFetch:
+    """
+    Attach `customerName`/`customerPhone` to the orders this collector has never
+    seen before. MUTATES the order dicts, and never raises.
+
+    ── WHY ONLY THE NEW ONES ────────────────────────────────────────────────────
+    This is a SECOND request per order, against the same production server the
+    window is being read from, and a customer's name does not change after the
+    order is placed. The window holds three days; watch mode re-reads it every ten
+    seconds. Fetching details for everything in the window would turn a poll that
+    costs one request into a poll that costs thirty, for ever, to re-learn what we
+    already know. So the question this asks is "which refs are new to us", and
+    `known_refs` is the answer that survives a restart.
+
+    ── WHAT A FAILURE COSTS, AND WHY IT IS NOT AN EXIT CODE ─────────────────────
+    Nothing but a name. Each fetch is wrapped on its own: a 500, an HTML error
+    page, a dropped connection or a payload we do not recognise leaves that one
+    order with no customer fields, is logged, and the run carries on and imports
+    the order exactly as it would have last week. The ledger takes both fields as
+    optional and never erases a stored one with a null, so a name missed today can
+    still land tomorrow if it is ever re-fetched.
+
+    ── ONE EXCEPTION, AND IT IS NOT THIS FUNCTION'S ─────────────────────────────
+    `AuthError` is re-raised. An expired session that `get_json`'s own re-login
+    could not fix is not "no customer for this order" — it is the whole run about
+    to fail, and swallowing it here would spend the cap knocking on a door that has
+    just been locked.
+    """
+    result = CustomerFetch()
+    # NEWEST FIRST: when the cap bites, it must bite on February's backfill and not
+    # on this evening's orders. `orderTime` can be None on either side, hence `or ""`.
+    new_orders = sorted(
+        (o for o in orders if o["refNo"] not in known_refs),
+        key=lambda o: (o["orderDate"], o["orderTime"] or ""),
+        reverse=True,
+    )
+    if not new_orders:
+        return result
+
+    for order in new_orders:
+        detail_id = detail_ids.get(order["refNo"])
+        if detail_id is None:
+            result.no_detail_id += 1
+            continue
+        if result.fetched >= MAX_DETAIL_FETCHES_PER_RUN:
+            result.over_cap += 1
+            continue
+
+        try:
+            payload = portal.get_json(
+                ORDER_DETAILS_PATH,
+                {"id": detail_id},
+                dump=False,
+            )
+        except AuthError:
+            raise
+        except (CollectorError, requests.RequestException) as err:
+            result.fetched += 1
+            result.failures += 1
+            LOG.warning("no customer for %s — %s: %s", order["refNo"], type(err).__name__, err)
+            continue
+
+        result.fetched += 1
+        if result.first_payload is None:
+            result.first_payload = payload
+
+        name, phone = parse_order_details(payload)
+        if name is None and phone is None:
+            # Not a failure: a portal is entitled to hold an order nobody left a
+            # name on. Counted so that "the endpoint changed shape" and "this
+            # customer is anonymous" do not look identical in the summary line.
+            result.failures += 1
+            LOG.info("%s: the details endpoint carried no customer", order["refNo"])
+            continue
+
+        # Only what the ledger takes. The address, the line items and the comment
+        # stay where they are — see `parse_order_details`.
+        order["customerName"] = name
+        order["customerPhone"] = phone
+        if name is not None:
+            result.found += 1
+
+    if result.over_cap:
+        LOG.warning(
+            "%d new order(s) past this run's %d-fetch details budget — imported without a customer, "
+            "and not retried. (This is what a --full backfill looks like; an ordinary run never sees it.)",
+            result.over_cap,
+            MAX_DETAIL_FETCHES_PER_RUN,
+        )
+    LOG.info(
+        "customer details: %d new ref(s), %d fetched, %d with a name, %d without",
+        len(new_orders),
+        result.fetched,
+        result.found,
+        result.failures,
+    )
+    return result
+
+
+def known_refs_path() -> Path:
+    return _state_dir / KNOWN_REFS_FILE
+
+
+def load_known_refs() -> dict[str, str]:
+    """
+    The refs whose details this collector has already asked about → their order date.
+
+    BEST-EFFORT, ALWAYS. A missing file is the first run; a corrupt one is a disk
+    that lost a write. Both answer "we know nothing", which costs one window of
+    re-asked details and nothing else — every one of those requests is idempotent
+    and the ledger's COALESCE makes a second answer harmless. Refusing to run over
+    a cache file would be the tail wagging the dog.
+    """
+    path = known_refs_path()
+    try:
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as err:
+        LOG.warning("%s is unreadable (%s) — treating every ref as new for this run", path, err)
+        return {}
+
+    refs = body.get("refs") if isinstance(body, dict) else None
+    if not isinstance(refs, dict):
+        LOG.warning("%s does not hold a 'refs' object — treating every ref as new for this run", path)
+        return {}
+    return {str(k): str(v) for k, v in refs.items() if isinstance(k, str)}
+
+
+def save_known_refs(refs: dict[str, str], today: date) -> None:
+    """
+    Write the ref→date map back, pruned, and never fail the run over it.
+
+    PRUNED BY THE ORDER'S OWN DATE, not by when we saw it: what bounds this file is
+    how far back the windows this collector reads go, and that is a fact about
+    order dates. A ref whose date we cannot parse is kept — the cost of keeping one
+    row too long is a row, and the cost of dropping it is re-asking the portal.
+    """
+    floor = (today - timedelta(days=KNOWN_REFS_KEEP_DAYS)).isoformat()
+    kept = {ref: day for ref, day in refs.items() if not (_DATE.match(day) and day < floor)}
+    try:
+        _state_dir.mkdir(parents=True, exist_ok=True)
+        known_refs_path().write_text(
+            json.dumps({"version": 1, "refs": kept}, indent=0, sort_keys=True),
+            encoding="utf-8",
+        )
+    except OSError as err:  # pragma: no cover - read-only home, disk full
+        # The import already happened. The only consequence of losing this is that
+        # the next run re-asks for details it already has, which is one wasted
+        # request per order and no wrong data anywhere.
+        LOG.warning("could not write %s (%s) — the next run will re-ask for these details", known_refs_path(), err)
 
 
 def scrape_item_summary(portal: Portal, business_date: date) -> tuple[list[dict[str, Any]], str]:
@@ -1300,6 +1643,22 @@ def dump_drift(body: str, label: str, suffix: str = ".html") -> Path | None:
     except OSError as err:  # pragma: no cover - disk full, read-only home
         LOG.error("could not write the drift dump: %s", err)
         return None
+
+
+def _evidence(body: str, label: str, dump: bool) -> str:
+    """
+    Keep what surprised us, in a file or in the message, and say which.
+
+    A dump is the right answer when a failure is rare and stops the run — somebody
+    is going to read it. It is the wrong answer for a call that happens once per
+    new order and whose failure costs a customer name: that produces a file per
+    order per day in a directory nothing prunes. The line goes in the rotating log
+    instead, truncated, which is where the person looking would go anyway.
+    """
+    if dump:
+        dump_drift(body, label, suffix=".txt")
+        return "the body is in the dump above."
+    return f"body: {collapse(body)[:300]!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -1379,6 +1738,11 @@ class Summary:
     status_changes: int = 0
     item_parse_failures: int = 0
     item_snapshot_rows: int = 0
+    #: Extra GETs of the details endpoint this run made, and how many of them
+    #: produced a customer name. `details` IS the answer to "what does this
+    #: feature cost the portal", so it is on the one line a human reads.
+    detail_fetches: int = 0
+    customers: int = 0
     exit_code: int = EXIT_OK
 
     def line(self) -> str:
@@ -1388,6 +1752,7 @@ class Summary:
             f"upserted={self.upserted} "
             f"unchanged={self.unchanged} status_changes={self.status_changes} "
             f"item_parse_failures={self.item_parse_failures} item_snapshot={self.item_snapshot_rows} "
+            f"details={self.detail_fetches} customers={self.customers} "
             f"exit={self.exit_code}"
         )
 
@@ -1404,7 +1769,12 @@ def window_for(args: argparse.Namespace, cfg: Config, today: date) -> tuple[date
     return today - timedelta(days=cfg.window_days), today
 
 
-def capture_fixtures(orders_payload: Any, summary_html: str, target: Path | None = None) -> None:
+def capture_fixtures(
+    orders_payload: Any,
+    summary_html: str,
+    target: Path | None = None,
+    details_payload: Any = None,
+) -> None:
     """
     Save the real responses beside the committed ones, for a maintainer to diff.
 
@@ -1415,25 +1785,34 @@ def capture_fixtures(orders_payload: Any, summary_html: str, target: Path | None
 
     WHAT COMES OUT OF HERE IS NOT COMMITTABLE AS-IS. It is a real window of a real
     restaurant: every row carries a customer's delivery address, and any of them
-    may carry the note that customer typed. The committed fixtures are
-    pseudonymized in those two cells (see PROMOTION, below), and the only thing
-    standing between a fresh capture and a real address in git is somebody
-    remembering that at the moment they copy a file. So this says it out loud,
-    here, where they are — rather than in a document they read once.
+    may carry the note that customer typed. THE DETAILS CAPTURE IS WORSE — it is
+    one named customer's full name, working mobile number and delivery address in
+    one small file. The committed fixtures are pseudonymized in every one of those
+    cells (see PROMOTION, below), and the only thing standing between a fresh
+    capture and a real person in git is somebody remembering that at the moment
+    they copy a file. So this says it out loud, here, where they are — rather than
+    in a document they read once.
 
     PROMOTION, the whole procedure:
 
-      1. Diff `captured-load-orders.json` against `load-orders.json`. Almost
-         always the answer is "nothing structural changed" and you stop.
-      2. If the portal really moved, copy the rows across and REPLACE the
-         location cell and any `Comment:` note with stand-ins — `KG 0NN St`,
-         `Testville`, `Test District` — keeping the SHAPE (one address with
-         commas in it, one bare place name).
+      1. Diff `captured-load-orders.json` against `load-orders.json`, and
+         `captured-load-order-details.json` against `load-order-details.json`.
+         Almost always the answer is "nothing structural changed" and you stop.
+      2. If the portal really moved, copy the rows across and REPLACE every cell
+         that is about a person with stand-ins, keeping the SHAPE:
+           * location → `KG 0NN St`, `Testville`, `Test District` (one address
+             with commas in it, one bare place name);
+           * any `Comment:` note → a stand-in sentence;
+           * `first_name`/`last_name` → the fixture's `Testcustomer` /
+             `Nyirahabimana`;
+           * `contact_phone` → `+250 780 000 042` — a Rwandan mobile's shape,
+             with a number nobody has.
       3. `uv run --project collector pytest`. The gate is
          `test_no_fixture_carries_a_real_customers_address_or_note`, which greps
          for the known real strings AND requires every location in every fixture
-         to look like a stand-in. A real address fails it whether or not anybody
-         thought to add it to the deny-list.
+         to look like a stand-in AND requires the details fixture's name and phone
+         to be the stand-ins. A real address or a real number fails it whether or
+         not anybody thought to add it to the deny-list.
 
     The captured files are git-ignored, so the only way one reaches a commit is a
     deliberate copy — and step 3 is what catches it when that copy is careless.
@@ -1443,6 +1822,8 @@ def capture_fixtures(orders_payload: Any, summary_html: str, target: Path | None
     written: list[tuple[str, str]] = []
     if orders_payload is not None:
         written.append(("captured-load-orders.json", _as_json_text(orders_payload)))
+    if details_payload is not None:
+        written.append(("captured-load-order-details.json", _as_json_text(details_payload)))
     if summary_html:
         written.append(("captured-sales-summary.html", summary_html))
     for name, body in written:
@@ -1450,9 +1831,9 @@ def capture_fixtures(orders_payload: Any, summary_html: str, target: Path | None
         LOG.info("captured %s", target / name)
     if written:
         LOG.warning(
-            "these captures hold REAL customer delivery addresses and notes — they are git-ignored "
-            "on purpose. Do not commit them. To promote a change into the committed fixtures, "
-            "replace the location and any Comment: note with stand-ins first; pytest's "
+            "these captures hold REAL customer delivery addresses, notes, NAMES and PHONE NUMBERS — "
+            "they are git-ignored on purpose. Do not commit them. To promote a change into the "
+            "committed fixtures, replace every one of those with stand-ins first; pytest's "
             "test_no_fixture_carries_a_real_customers_address_or_note is what enforces it."
         )
 
@@ -1477,11 +1858,24 @@ def run(cfg: Config, args: argparse.Namespace, portal: Portal | None = None) -> 
             sorted(set(scraped.unknown_payment_types)),
         )
 
+    # THE CUSTOMER, FOR THE ORDERS THAT ARE NEW TO US, AND ONLY THEM. One extra
+    # GET each, inside the same run that is about to POST them — so a watch-mode
+    # poll that found nothing new costs the details endpoint nothing at all, which
+    # is the whole reason `known_refs` is on disk rather than in this function.
+    #
+    # Deliberately BEFORE the item snapshot and the dry-run print: the fields it
+    # attaches are part of the payload, so `--dry-run` has to show them or it is
+    # not showing what a real run would send.
+    known_refs = load_known_refs()
+    customers = fetch_customer_details(portal, scraped.orders, scraped.detail_ids, known_refs)
+    summary.detail_fetches = customers.fetched
+    summary.customers = customers.found
+
     items, summary_html = scrape_item_summary(portal, end)
     summary.item_snapshot_rows = len(items)
 
     if args.capture_fixtures:
-        capture_fixtures(scraped.first_page_payload, summary_html)
+        capture_fixtures(scraped.first_page_payload, summary_html, details_payload=customers.first_payload)
 
     if args.dry_run:
         # stdout, not the log: this is output somebody is reading right now, and
@@ -1526,6 +1920,17 @@ def run(cfg: Config, args: argparse.Namespace, portal: Portal | None = None) -> 
             result.get("unchanged"),
             result.get("statusChanges"),
         )
+
+    # EVERY ref in the window is now known — not just the ones a detail fetch
+    # succeeded for. One attempt per order is the rule: an order the portal has no
+    # customer for, or whose fetch failed, must not be re-asked on every run for
+    # ever, and the ledger keeps whatever it was told whenever it was told it.
+    #
+    # AFTER the POST, and only after: a ref recorded here is a ref this program
+    # will never ask about again, so recording one whose import then failed would
+    # mean an order that lands on the retry with no customer and no second chance.
+    known_refs.update({order["refNo"]: order["orderDate"] for order in scraped.orders})
+    save_known_refs(known_refs, today)
 
     if items:
         for chunk in chunks(items, PER_PAGE):
@@ -1655,6 +2060,11 @@ def watch(
     login, against the 720 logins a day the two-minute one-shot cadence spends
     now. That is the trade this mode exists to make: many more cheap reads, three
     orders of magnitude fewer authentications.
+
+    The customer-details fetch does NOT ride on the poll. It happens inside `run`,
+    which only fires when the digest moved, and only for refs this collector has
+    never seen — so its cost is one extra GET per ORDER PLACED (a handful a day),
+    not one per poll. A quiet afternoon adds nothing to the numbers above.
 
     WHY PAGE 1 AND NOT THE WHOLE WINDOW. Page 1 is 100 rows, and this restaurant's
     three-day window is comfortably inside that, so on any ordinary day page 1 IS
