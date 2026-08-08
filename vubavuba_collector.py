@@ -42,13 +42,14 @@ this is a one-shot: log in, read the window, POST, exit — which is what the
 launchd agent and the GitHub Actions backstop run, and what everything below
 describes unless it says otherwise. `--watch` is the same program with the
 sleeping done on the inside: it logs in ONCE, then re-reads the recent window
-every ten seconds on that one session and imports only when the payload actually
-changed. The owner wants an order in the kitchen within ten seconds of it being
-placed, and the arithmetic is what forces the shape. A one-shot every ten seconds
-is 8,640 logins a day against somebody's merchant account — a login flood that
-looks exactly like credential stuffing, and the account it endangers is the
-restaurant's. Ten-second polls on one session is a merchant watching their own
-dashboard, which is what the portal is for.
+every five seconds on that one session and imports only when the payload actually
+changed. The owner wants an order in the kitchen within seconds of it being
+placed, and the arithmetic is what forces the shape. A one-shot at that cadence is
+tens of thousands of logins a day against somebody's merchant account — a login
+flood that looks exactly like credential stuffing, and the account it endangers is
+the restaurant's. Fast polls on ONE session is a merchant watching their own
+dashboard, which is what the portal is for. `WATCH_POLL_SECONDS` carries the rest
+of the arithmetic, including why five and not two.
 
 WHAT THIS PROGRAM PROMISES
 
@@ -322,16 +323,44 @@ KNOWN_REFS_KEEP_DAYS = 30
 ACTIVE_HOUR_FROM = 7
 ACTIVE_HOUR_TO = 23
 
-#: `--watch`: how often to re-read the window, and the floor under it. Ten
-#: seconds is the freshness the owner asked for; the floor is there because
-#: `WATCH_POLL_SECONDS=1` in a config file is a typo away and this is somebody
-#: else's production server. Both are seconds.
+#: `--watch`: how often to re-read the window, and the floor under it. Both are
+#: seconds, and the default now SITS ON the floor.
 #:
 #: It is the GAP between polls, not a period: the request itself and the
-#: one-per-second courtesy throttle add a second or two on top, so ten here is a
-#: new order noticed within about twelve seconds and usually half that. Somebody
-#: who wants the ten to be a ceiling sets this to 5.
-WATCH_POLL_SECONDS = 10.0
+#: one-per-second courtesy throttle add a second or two on top, so five here is a
+#: new order noticed within about seven seconds and often less.
+#:
+#: ── WHY IT MOVED FROM TEN TO FIVE, WITH THE ARITHMETIC ─────────────────────
+#:
+#: The owner's complaint after a week of live use was that the counter learns
+#: about a Vubavuba order roughly ten seconds after the rider's app does, and in
+#: that ten seconds a customer is standing at a till nobody has told. Halving the
+#: gap costs, over the 17 active hours (07:00–23:59, `ACTIVE_HOUR_*`):
+#:
+#:     61,200 s ÷ 5 s  ≈  12,000 portal reads a day   (was ≈ 6,000 at ten)
+#:
+#: which is one request every five seconds from ONE logged-in session — about what
+#: a human refreshing a dashboard with a hand on F5 produces, and the shape is what
+#: matters here rather than the number. The portal is somebody else's production
+#: server and this is a merchant account that can be suspended by a person who
+#: thinks they are being scraped, so the honest ceiling is "still looks like a
+#: person watching a screen".
+#:
+#: ── THE TWO-SECOND ASK IS REFUSED, AND THIS IS THE REASON ──────────────────
+#:
+#: Two seconds is ≈ 31,000 reads over the same hours — and ≈ 43,000 a day if
+#: anybody ever removed the night skip — which stops looking like somebody
+#: watching a screen and starts looking like a bot hammering a login-gated
+#: endpoint. It also stops buying anything: the request and the one-per-second
+#: throttle already put a second or two under every poll, so the real gain from
+#: 5 s to 2 s is about three seconds of freshness in exchange for two and a half
+#: times the traffic and a merchant account nobody can un-suspend from here. The
+#: floor stays at five and this is the line: below it, `load_config` clamps and
+#: says so.
+#:
+#: The floor also exists because `WATCH_POLL_SECONDS=1` in a config file is a typo
+#: away. Somebody who wants the old behaviour back sets `WATCH_POLL_SECONDS=10`.
+WATCH_POLL_SECONDS = 5.0
 WATCH_POLL_FLOOR = 5.0
 
 #: `--watch` backoff after a failed poll: 15s, doubling, never longer than five
