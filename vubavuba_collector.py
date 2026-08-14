@@ -72,6 +72,14 @@ one failure the phone's launcher already fixes by itself, in thirty seconds.
 Neither can cost an import: the ping never raises into the loop and is never
 retried, and the deadman is beaten by every request and every deliberate wait.
 
+THE DEADMAN LOOKS TWICE, AND THE PHONE IS WHY (2026-08-14, the same day). The
+restaurant's Samsung freezes the whole Pydroid process — every thread together,
+with the monotonic clock still ticking — so a thaw arrives looking exactly like a
+hang, and the first version killed the collector every few minutes for a loop that
+was about to resume perfectly. A silence past the limit is now an OBSERVATION: the
+verdict comes a grace later, and a loop that moved in between was frozen, not
+hung. `DEADMAN=0` in the credentials file is the escape hatch under that.
+
 WHAT THIS PROGRAM PROMISES
 
   * It never guesses. Money that does not parse, a row whose column count
@@ -489,8 +497,25 @@ WATCH_PING_TIMEOUT = 5.0
 DEADMAN_POLL_MULTIPLE = 3
 DEADMAN_FLOOR_SECONDS = 60.0
 
+#: THE GRACE: how long a first look past that limit waits before it is allowed to
+#: be a verdict. **This is the whole 2026-08-14 fix**; `Deadman` carries the field
+#: evidence and the reasoning, and this carries the arithmetic.
+#:
+#: Twice the poll gap is "the loop had two whole polls to prove it is moving", and
+#: the fifteen-second floor is what keeps the five-second gap from making the
+#: grace so short that a thawing process — which has a page to fetch before it can
+#: beat anything — is judged before it has had a chance to answer. At the default
+#: that is fifteen seconds, and it costs a REAL hang fifteen seconds of lateness:
+#: 60s to be suspected, 75s to be killed. That is the price of not killing a phone
+#: that was only frozen, and it is worth it — a needless exit here is the owner
+#: walking to the counter to press play.
+DEADMAN_GRACE_POLL_MULTIPLE = 2
+DEADMAN_GRACE_FLOOR_SECONDS = 15.0
+
 #: How often the deadman thread wakes up to look at the clock. Cheap: a sleeping
-#: thread costs nothing, and this only bounds how late the diagnosis can be.
+#: thread costs nothing, and this only bounds how late the diagnosis can be. It is
+#: also comfortably under `DEADMAN_GRACE_FLOOR_SECONDS`, so the grace always gets
+#: at least one look of its own rather than expiring between two ticks.
 DEADMAN_CHECK_SECONDS = 5.0
 
 DEFAULT_ENV_FILE = Path.home() / ".config" / "resto-ledger" / "collector.env"
@@ -514,6 +539,9 @@ class Config:
     portal_base: str = PORTAL_BASE
     #: `--watch` only. Ignored by every one-shot run.
     watch_poll_seconds: float = WATCH_POLL_SECONDS
+    #: `--watch` only, and the one switch in this file that turns a safety net OFF.
+    #: `DEADMAN=0` in the credentials file; `load_config` carries the reasoning.
+    deadman_enabled: bool = True
 
     @property
     def secrets(self) -> tuple[str, ...]:
@@ -610,6 +638,22 @@ def load_config(path: Path = DEFAULT_ENV_FILE) -> Config:
         )
         poll_seconds = WATCH_POLL_FLOOR
 
+    # THE ESCAPE HATCH OF LAST RESORT, and the only line in this file that can
+    # switch a safety net off: `DEADMAN=0`. It exists because the deadman lives on
+    # somebody else's phone, and if a future Android build finds a THIRD way to
+    # stop a process — one the grace does not survive either — the choice must not
+    # be "edit Python on a phone" or "no collector". A watch loop with no deadman
+    # still imports; a deadman that keeps killing a healthy one imports nothing.
+    #
+    # UNRECOGNISED MEANS ARMED. Anything that is not a plain no leaves the monitor
+    # on and says so, because the failure of a typo must be the safe direction:
+    # `DEADMAN=maybe` disabling the net that catches a silent phone is exactly the
+    # outage this whole section exists for.
+    raw_deadman = values.get("DEADMAN", "").strip().lower()
+    deadman_enabled = raw_deadman not in ("0", "false", "no", "off")
+    if deadman_enabled and raw_deadman and raw_deadman not in ("1", "true", "yes", "on"):
+        LOG.warning("DEADMAN=%r is not a yes or a no — the deadman stays ARMED (DEADMAN=0 disables it)", raw_deadman)
+
     return Config(
         username=values["VUBAVUBA_USERNAME"],
         password=values["VUBAVUBA_PASSWORD"],
@@ -618,6 +662,7 @@ def load_config(path: Path = DEFAULT_ENV_FILE) -> Config:
         window_days=window_days,
         portal_base=(values.get("VUBAVUBA_BASE_URL") or PORTAL_BASE).rstrip("/"),
         watch_poll_seconds=poll_seconds,
+        deadman_enabled=deadman_enabled,
     )
 
 
@@ -2372,6 +2417,11 @@ def deadman_limit(poll_seconds: float) -> float:
     return max(DEADMAN_POLL_MULTIPLE * float(poll_seconds), DEADMAN_FLOOR_SECONDS)
 
 
+def deadman_grace(poll_seconds: float) -> float:
+    """How long a silence is given to disprove itself before it is a hang."""
+    return max(DEADMAN_GRACE_POLL_MULTIPLE * float(poll_seconds), DEADMAN_GRACE_FLOOR_SECONDS)
+
+
 class Deadman:
     """
     A daemon thread that kills this process if the loop stops making progress.
@@ -2399,13 +2449,39 @@ class Deadman:
     exactly the property that makes this a hang detector and not a timeout on
     slowness.
 
-    ── `time.monotonic`, AND WHY IT IS THE RIGHT CLOCK HERE ────────────────────
+    ── THE CLOCK, AND WHAT THE S5 TAUGHT US ABOUT IT (2026-08-14) ──────────────
 
-    It does not run while the device is suspended, and that is the behaviour we
-    want: a phone whose whole process Android froze for ten minutes has not hung,
-    and thawing it into an immediate suicide would turn power management into an
-    outage. What DOES advance it is a frozen main thread beside a live one — the
-    Pydroid failure this exists to catch.
+    `time.monotonic` does not run while the DEVICE is suspended, and the first
+    version of this class leaned on that: a phone whose process Android had frozen
+    would come back with the clock roughly where it left off, and thawing it into
+    an immediate suicide would have turned power management into an outage.
+
+    The restaurant's Samsung S5 disproved that on its first day. TouchWiz's app
+    freezer does not suspend the device — it stops THIS PROCESS while the phone
+    stays awake, so `CLOCK_MONOTONIC` runs the whole time and a loop that was
+    frozen for ten minutes thaws looking exactly like a loop that hung ten minutes
+    ago. The deadman built to kill hangs was killing THAWS: the collector ran for a
+    few minutes, exited 3, and stayed dead until somebody walked over and pressed
+    play. On 2026-08-14 the imports stopped at 09:47 Kigali and did not come back
+    for over an hour, through repeated restarts by hand.
+
+    ── THE GRACE: A SILENCE IS AN OBSERVATION, NOT YET A VERDICT ───────────────
+
+    So the first look past the limit kills nothing. It records what it saw, and the
+    verdict comes one `deadman_grace` later — and in that gap the two cases sort
+    themselves out, on the one fact the freezer hands us: **it freezes every thread
+    together.** If this monitor thread is running again, the loop thread is running
+    again too; a thawed loop finishes its sleep or its socket read and beats within
+    a poll or two, and the whole episode costs one line in the log. A hung loop
+    beats NOTHING, because the call it is stuck in has not returned and no thaw is
+    going to make it return, so the second look sees precisely what the first one
+    saw and the process ends exactly as it did before.
+
+    THE ONE CASE THIS STILL GETS WRONG, written down rather than hidden: a process
+    frozen AGAIN, within seconds of thawing, for longer than the grace. The second
+    look then finds a silence that never moved and calls it a hang. The cost of
+    that mistake is a restart the launcher already handles in thirty seconds, and
+    for a phone where even that is too often there is `DEADMAN=0`.
 
     ── `os._exit`, AND NOT `sys.exit` ──────────────────────────────────────────
 
@@ -2417,16 +2493,34 @@ class Deadman:
     program makes is an idempotent upsert the next run converges on.
     """
 
-    def __init__(self, limit: float, clock: Any = time.monotonic) -> None:
+    def __init__(
+        self,
+        limit: float,
+        clock: Any = time.monotonic,
+        grace: float = DEADMAN_GRACE_FLOOR_SECONDS,
+    ) -> None:
         self.limit = float(limit)
+        self.grace = float(grace)
         self._clock = clock
         self._last = clock()
+        self._beats = 0
+        # The outstanding stale observation, or None when nothing is in doubt:
+        # when it was seen, how silent things were then, and the beat count at
+        # that moment — which is what the second look compares against.
+        self._stale_at: float | None = None
+        self._stale_silent = 0.0
+        self._stale_beats = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def beat(self) -> None:
         """Progress. Called from four places; see the class docstring."""
         self._last = self._clock()
+        # COUNTED as well as timestamped. "Did anything move during the grace" has
+        # to be answerable without trusting the resolution of somebody's clock, and
+        # two beats inside one tick of a coarse one would leave `_last` unchanged.
+        # One writer (the loop thread) and one reader (this monitor), so no lock.
+        self._beats += 1
 
     def silent_for(self) -> float:
         return self._clock() - self._last
@@ -2435,33 +2529,95 @@ class Deadman:
         return self.silent_for() > self.limit
 
     def check(self) -> bool:
-        """Look once. Returns True — and does not return at all — if it tripped."""
+        """
+        Look once. Returns True — and does not return at all — if it tripped.
+
+        TWO LOOKS WITH A GRACE BETWEEN THEM, never one — see the class docstring
+        for the phone that made that necessary. The first look past the limit only
+        writes down what it saw; a loop that moves before the second one is a
+        process somebody froze, and this says so and forgets it.
+        """
+        if self._stale_at is not None and self._beats != self._stale_beats:
+            # It moved after all. Frozen, then thawed — not hung.
+            self._thawed()
+            return False
         if not self.overdue():
+            # The ordinary quiet look — and the belt on the one above: whatever
+            # was in doubt is not in doubt any more.
+            self._stale_at = None
+            return False
+
+        now = self._clock()
+        if self._stale_at is None:
+            self._stale_at = now
+            self._stale_silent = now - self._last
+            self._stale_beats = self._beats
+            # DEBUG and not WARNING: on the S5 this fires on every thaw, and a
+            # line each would bury the ones that mean something. The verdict —
+            # either way — is what gets said out loud, and it carries this
+            # observation with it.
+            LOG.debug(
+                "no progress for %.0fs (limit %.0fs) — looking again after %.0fs before calling it a hang",
+                self._stale_silent,
+                self.limit,
+                self.grace,
+            )
+            return False
+
+        if now - self._stale_at < self.grace:
             return False
         self.trip()
         return True
 
+    def _thawed(self) -> None:
+        """
+        One line for a freeze that ended, and then forget it happened.
+
+        INFO, and exactly one line: this is the answer to "why did the counter
+        wait four minutes for that order", and on this phone it may be the most
+        useful line in the log — but it is also frequent, and a WARNING that
+        arrives every few minutes stops being read.
+        """
+        LOG.info(
+            "this process was frozen ~%.0fs and has resumed — the loop moved again inside the %.0fs "
+            "grace, so nothing was killed (Android stops every thread together; the clock kept running)",
+            self._stale_silent,
+            self.grace,
+        )
+        self._stale_at = None
+
     def trip(self) -> None:
         """
         Say what happened, loudly and with the evidence, then end the process.
+
+        BOTH LOOKS ARE IN THE LINE, because the second one is the whole argument:
+        a frozen process moves in that gap and a hung one cannot, so "silent then,
+        silent again now, nothing in between" is what separates the failure this
+        kills for from the one it must not.
 
         The stack of EVERY thread, not just the main one, because "which call did
         it stop in" is the entire diagnosis and the answer is as likely to be in a
         `requests` read as in this file. It goes through the ordinary log, which
         on the phone is a file somebody can be talked through opening.
         """
+        waited = 0.0 if self._stale_at is None else self._clock() - self._stale_at
+        first_silent = self.silent_for() if self._stale_at is None else self._stale_silent
         LOG.critical(
-            "THE WATCH LOOP HAS HUNG — no progress for %.0fs (limit %.0fs). "
-            "Killing this process so the launcher can start a fresh one; "
-            "every write this program makes is an idempotent upsert, so nothing is lost.",
+            "THE WATCH LOOP HAS HUNG — no progress for %.0fs (limit %.0fs), and none in the %.0fs "
+            "since it was first seen stale at %.0fs silent. A process somebody froze moves in that "
+            "gap; this one did not. Killing it so the launcher can start a fresh one; every write "
+            "this program makes is an idempotent upsert, so nothing is lost.",
             self.silent_for(),
             self.limit,
+            waited,
+            first_silent,
         )
         LOG.critical("what every thread was doing:\n%s", thread_dump())
         os._exit(EXIT_HANG)
 
     def start(self) -> "Deadman":
         self.beat()
+        self._stale_at = None
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="deadman", daemon=True)
         self._thread.start()
@@ -2634,6 +2790,13 @@ def watch(
     Neither can affect an import. The ping cannot raise into the loop and is never
     retried; the deadman is beaten by every request and every deliberate wait, so
     only a wait nobody chose can trip it.
+
+    AND WHAT THE PHONE MADE US ADD TO THAT, THE SAME WEEK. The S5 freezes the whole
+    process — every thread at once, with the clock still running — and the deadman
+    read each thaw as a hang and killed a loop that was about to resume. It now
+    looks TWICE, one `deadman_grace` apart, and only a silence that survives both
+    is a hang (`Deadman`). `DEADMAN=0` in the credentials file arms nothing at all,
+    for the phone where even that is not enough.
     """
     global _deadman
 
@@ -2667,10 +2830,29 @@ def watch(
     # stack. A monitor left armed after this function returns would be a thread
     # watching a clock nobody winds any more — and thirty to sixty seconds later
     # it would kill a perfectly healthy process for a loop that ended on purpose.
-    monitor = deadman if deadman is not None else Deadman(deadman_limit(poll_seconds))
-    _deadman = monitor
-    monitor.start()
-    LOG.info("deadman armed: %.0fs without progress ends this process (the launcher restarts it)", monitor.limit)
+    #
+    # AND `DEADMAN=0` ARMS NOTHING AT ALL — not a stopped monitor, not a thread
+    # that never trips: no thread. It is the escape hatch for a phone the grace
+    # cannot save (`load_config` has the reasoning), and an escape hatch that
+    # leaves the machinery running is one nobody can be talked through trusting.
+    monitor: Deadman | None = None
+    if not cfg.deadman_enabled:
+        LOG.warning(
+            "DEADMAN=0 — the deadman is DISABLED for this run. A hang will now look exactly like a "
+            "quiet afternoon from in here; the liveness ping is the only thing left to tell the counter."
+        )
+    else:
+        monitor = deadman if deadman is not None else Deadman(
+            deadman_limit(poll_seconds), grace=deadman_grace(poll_seconds)
+        )
+        _deadman = monitor
+        monitor.start()
+        LOG.info(
+            "deadman armed: %.0fs without progress, then %.0fs of grace to disprove it, ends this "
+            "process (the launcher restarts it)",
+            monitor.limit,
+            monitor.grace,
+        )
     try:
         while not stop:
             shut_for = seconds_until_active()
@@ -2783,7 +2965,8 @@ def watch(
         # `main` — is not a hang, and the monitor must not outlive it. The global
         # is cleared too, so `beat()` from a one-shot run in the same process
         # (the phone's launcher calls `main` in a loop) is the no-op it should be.
-        monitor.stop()
+        if monitor is not None:
+            monitor.stop()
         _deadman = None
 
 
