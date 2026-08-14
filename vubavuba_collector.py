@@ -481,6 +481,51 @@ WATCH_PING_EVERY_N_POLLS = 4
 #: stand between a customer's order and the kitchen. See `ping_ledger`.
 WATCH_PING_TIMEOUT = 5.0
 
+#: HOW MANY CHARACTERS OF THIS FILE'S FINGERPRINT THE PING CARRIES.
+#:
+#: THE FAILURE IT MAKES VISIBLE. The collector on the S5 is updated BY HAND:
+#: somebody copies a new file onto the phone and presses ▶. When that half-
+#: happens — the copy went to the wrong folder, the app was never restarted, the
+#: person was interrupted — the phone keeps beating perfectly happily on last
+#: month's code, and nothing anywhere says so. A fix everybody believes shipped
+#: and did not is worse than an outage: an outage rings the counter.
+#:
+#: DERIVED, NEVER TYPED. A hand-bumped `__version__` is a number somebody has to
+#: remember to change, and the edit that gets forgotten is always the one shipped
+#: in a hurry. A file's own fingerprint cannot be forgotten and cannot lie: two
+#: collectors report the same version if and only if they are the same bytes.
+#:
+#: EIGHT, because a person reads this off a phone screen and compares it by eye
+#: with what the Ops page shows. Thirty-two bits against a handful of builds a
+#: year is a collision nobody will meet, and sixty-four characters is a string
+#: nobody would check.
+COLLECTOR_VERSION_CHARS = 8
+
+#: What the version is when this file cannot be read at all — a zipimport, an
+#: install that stripped the sources. NOT an exception and not an empty string:
+#: the ping still goes, the watch still works, and the word itself is the report.
+#: It is what the startup line prints and what the Ops page would show, so the
+#: one thing it can never be is silent.
+VERSION_UNKNOWN = "unknown"
+
+
+def _self_version() -> str:
+    """This file's own fingerprint, shortened. Reads the source, hashes the bytes."""
+    try:
+        source = Path(__file__).resolve().read_bytes()
+    except OSError:
+        return VERSION_UNKNOWN
+    return hashlib.sha256(source).hexdigest()[:COLLECTOR_VERSION_CHARS]
+
+
+#: ONCE, AT IMPORT — and deliberately not something the ping recomputes.
+#:
+#: The version has to describe the code that is RUNNING. A file re-read on every
+#: ping would start reporting an edit this process has not loaded, and a phone
+#: that looks updated while it is still executing the old bytes is worse than a
+#: phone with no version at all. (It also saves ~3,000 file reads a day.)
+COLLECTOR_VERSION = _self_version()
+
 #: THE DEADMAN: how far behind the loop may fall before this process kills itself
 #: so that something else can start it again.
 #:
@@ -2081,9 +2126,19 @@ def ping_ledger(cfg: Config, at: str | None = None) -> bool:
     is fine while it is dead, or that it is dead while it is fine. This is what a
     person reads in a log when they want to know what the phone believed the time
     was.
+
+    `v` IS THE ONE FIELD THE LEDGER KEEPS: this file's own fingerprint
+    (`COLLECTOR_VERSION`), so the owner's Ops page can show that the phone is
+    alive AND that it is running something older than the newest build the ledger
+    has ever heard from — the half-finished hand update this whole field exists
+    for. It rides the ping rather than getting a call of its own because it costs
+    eight characters on a request that was already going.
     """
     url = f"{cfg.api_base}{HEARTBEAT_PATH}"
-    body = {"at": at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+    body = {
+        "at": at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "v": COLLECTOR_VERSION,
+    }
     headers = {
         "Content-Type": "application/json",
         # The csrf guard covers /api/imports — the ping satisfies it exactly like
@@ -2831,6 +2886,12 @@ def watch(
         ACTIVE_HOUR_FROM,
         ACTIVE_HOUR_TO,
     )
+    # WHICH COPY OF THIS FILE IS ACTUALLY RUNNING. Its own line, because it is the
+    # one thing a person standing at the phone after a hand update needs to read
+    # back to somebody: the same eight characters the liveness ping carries and the
+    # Ops page shows, so "did the new file take?" is answered by comparing them.
+    LOG.info("this collector is version %s (the first %d characters of its own file's fingerprint)",
+             COLLECTOR_VERSION, COLLECTOR_VERSION_CHARS)
 
     # ARMED HERE AND NOWHERE ELSE, and stood down in the `finally` below, because
     # the module-level handle is what `beat()` reaches from the bottom of the call
