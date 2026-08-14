@@ -746,6 +746,13 @@ _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TIME = re.compile(r"^\d{2}:\d{2}:\d{2}$")
 
 
+def strip_suffix(value: str, suffix: str) -> str:
+    """Suffix stripping spelled for Python 3.8 — the S5's Termux runs 3.8.0, and
+    the money path (RWF stripping) must parse there too. One collector file
+    serves every runtime; no fork."""
+    return value[: -len(suffix)] if suffix and value.endswith(suffix) else value
+
+
 def collapse(text: str) -> str:
     """One space between words, nothing at the ends. HTML whitespace is noise."""
     return _WHITESPACE.sub(" ", (text or "").replace("\xa0", " ")).strip()
@@ -1608,7 +1615,7 @@ def _detail_int(value: Any) -> int | None:
         return int(value) if value.is_integer() else None
     if not isinstance(value, str):
         return None
-    text = collapse(value).upper().removesuffix("RWF").replace(",", "").replace(" ", "")
+    text = strip_suffix(collapse(value).upper(), "RWF").replace(",", "").replace(" ", "")
     return int(text) if _INTEGER.match(text) else None
 
 
@@ -1943,7 +1950,7 @@ _state_dir = DEFAULT_STATE_DIR
 
 def _label_for(path: str) -> str:
     """`/api/load_orders.php` → `load-orders`. What a drift dump gets named."""
-    return path.rsplit("/", 1)[-1].removesuffix(".php").replace("_", "-") or "response"
+    return strip_suffix(path.rsplit("/", 1)[-1], ".php").replace("_", "-") or "response"
 
 
 def _as_json_text(payload: Any) -> str:
