@@ -31,6 +31,16 @@ is what remembers which those are across restarts. A details fetch that fails
 costs that order its customer and nothing else — the order still imports, and both
 fields are optional all the way through the ledger.
 
+…AND, SINCE 2026-08-13, THE DISHES (`itemData`). That same response carries
+`item_data`: one row per dish with its quantity, size, price, per-dish notes and
+the ADD-ONS the customer chose — the protein, the sides, the spice level. The
+report's free-text `Item` cell has none of that, so a four-combo order reached the
+cooks as "3× Fried rice, 1× Party Jollof" and every choice in it was lost between
+the customer and the pan (order 2929745, the owner's screenshots). It rides the
+SAME request the customer already costs — zero extra load on the portal — and is
+attached as one more optional wire field. A fetch that fails still sends the order
+WITHOUT it, exactly as before, and the ledger falls back to what the list gave us.
+
   The split the owner asked for, enforced on the SERVER and written here because
   this is where the data enters: the ledger app shows the name AND the phone; the
   Telegram kitchen ticket and counter alert show the NAME ONLY. Nothing in this
@@ -50,6 +60,17 @@ flood that looks exactly like credential stuffing, and the account it endangers 
 the restaurant's. Fast polls on ONE session is a merchant watching their own
 dashboard, which is what the portal is for. `WATCH_POLL_SECONDS` carries the rest
 of the arithmetic, including why five and not two.
+
+AND SINCE 2026-08-14, IT SAYS SO OUT LOUD. Watch mode adds two things that exist
+for one failure — the phone that quietly stops watching. Every fourth completed
+poll POSTs a liveness ping to the ledger (`ping_ledger`), which is how the Worker
+can tell within seconds that this program has gone quiet and put the plain-English
+"pick up the black phone" instructions on the counter's Telegram. And a deadman
+thread (`Deadman`) watches the loop's own progress: a hang — the process alive,
+the loop stuck in a call that never returns — becomes an exit, and an exit is the
+one failure the phone's launcher already fixes by itself, in thirty seconds.
+Neither can cost an import: the ping never raises into the loop and is never
+retried, and the deadman is beaten by every request and every deliberate wait.
 
 WHAT THIS PROGRAM PROMISES
 
@@ -73,6 +94,9 @@ EXIT CODES — launchd and a human read these.
     1  unexpected error, including a pagination loop that would not end (a bug here)
     2  configuration problem (missing file, wrong permissions, missing key)
     3  authentication failed (the message says wrong credentials vs portal change)
+       — and, in `--watch` ONLY, the deadman: the loop stopped making progress and
+       killed the process so the launcher would start a fresh one. The two cannot
+       be confused; `EXIT_HANG` says why, and the log line above the exit shouts.
     4  PORTAL DRIFT — the page is not the page we know. HTML dumped for a human.
     5  the ledger API refused or could not be reached after retries
     6  the portal was unreachable (network, DNS, timeout) — nothing to fix here
@@ -97,7 +121,9 @@ import re
 import signal
 import stat
 import sys
+import threading
 import time
+import traceback
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
@@ -118,6 +144,18 @@ EXIT_AUTH = 3
 EXIT_DRIFT = 4
 EXIT_API = 5
 EXIT_UNREACHABLE = 6
+
+#: What the deadman exits with when `--watch` has hung. **THREE, the same number
+#: `EXIT_AUTH` uses**, and the overlap is deliberate rather than an oversight.
+#:
+#: The two can never be confused, because they belong to different programs. A
+#: one-shot run is the only thing that exits 3 for authentication — watch mode
+#: catches every failure inside its own loop and backs off instead (see `watch`),
+#: so an `AuthError` cannot reach `main` from there — and the deadman only exists
+#: inside watch mode, which never exits 3 for anything else. The line logged
+#: immediately before this exit says which one happened, in capitals, with a stack
+#: for every thread under it.
+EXIT_HANG = 3
 
 
 class CollectorError(Exception):
@@ -190,11 +228,12 @@ ORDERS_API_PATH = "/api/load_orders.php"
 #: **Details** button: `sales-report.php`'s `openOrderModal(id)` fetches this with
 #: the session cookie and renders the modal from it.
 #:
-#: The keys this program reads are three: `first_name`, `last_name`,
-#: `contact_phone`. The response carries a good deal more (`delivery_address`,
-#: `delivery_charge`, `sub_total`, `status`, `json_details`, `comment`, `ebm`, and
-#: an `item_data` array of per-dish rows with quantities, prices, sizes and
-#: add-ons) — see `parse_order_details` for why none of the rest is touched today.
+#: The keys this program reads are four: `first_name`, `last_name`,
+#: `contact_phone` and — since 2026-08-13 — `item_data`, the per-dish rows with
+#: quantities, prices, sizes, notes and add-ons (`parse_order_items`). The response
+#: carries more still (`delivery_address`, `delivery_charge`, `sub_total`,
+#: `status`, `json_details`, `comment`, `ebm`); none of that is touched, because
+#: every one of those facts already reaches the ledger from the order list.
 ORDER_DETAILS_PATH = "/api/order_handler.php"
 
 #: The page a human opens. Nothing is read from it — it is here so that the log
@@ -299,6 +338,19 @@ HISTORY_START = date(2026, 1, 1)
 #: and a phone call are actually about.
 MAX_DETAIL_FETCHES_PER_RUN = 25
 
+#: The most dishes, and the most add-ons on one dish, this program will carry off
+#: the details endpoint.
+#:
+#: A CEILING, NOT A TRUNCATION. Both are far beyond anything this restaurant sells
+#: in one order — the biggest seen is four combos of three add-ons each — so a
+#: payload past either of them is not a big order, it is a response this program
+#: does not understand. It is refused WHOLE (`parse_order_items` returns None) and
+#: the order imports with the item cell it has always had, because half a dish list
+#: on a kitchen ticket is worse than the honest short one: a cook who can see four
+#: dishes and is handed three has no way to know they were shorted.
+MAX_DETAIL_ITEMS = 50
+MAX_DETAIL_ADDONS = 20
+
 #: Where "we have already asked about this ref" is remembered between runs, under
 #: the state directory beside the log and the drift dumps.
 #:
@@ -389,6 +441,57 @@ WATCH_HEARTBEAT_SECONDS = 3600.0
 #: after a handler returns — an eight-hour night sleep would swallow the SIGTERM
 #: that was meant to stop it, and the operator would be left holding Ctrl-C.
 WATCH_SLEEP_CHUNK = 5.0
+
+#: WHERE THE LIVENESS PING GOES, and the ONE thing it is for: so the ledger can
+#: tell "this phone is watching" from "this phone stopped", within seconds, and
+#: ring the counter with the instructions when it stopped.
+#:
+#: Not to be confused with `WATCH_HEARTBEAT_SECONDS` above, which is a LINE IN THE
+#: LOG for a human once an hour. This is a POST for the Worker, and the Worker's
+#: Durable Object is what turns its absence into a message on somebody's phone.
+HEARTBEAT_PATH = "/api/imports/vubavuba/heartbeat"
+
+#: One ping every fourth completed poll — about one every 20-25 seconds at the
+#: five-second gap, against the Worker's ">90 seconds of silence is an outage"
+#: rule. Three or four pings have to go missing before anybody is told, which is
+#: what keeps one dropped packet on a phone's wifi from ringing the counter.
+#:
+#: FOUR AND NOT ONE. A ping per poll is ~12,000 extra requests a day against the
+#: Workers Free plan's 100,000 for the whole account (ADR-022 does that
+#: arithmetic for the sockets) — real money's worth of budget for freshness
+#: nobody can perceive. Four is ~3,000 a day, and the detection window it buys is
+#: still inside the owner's "within about thirty seconds".
+#:
+#: AN IMPORT IS ALSO A HEARTBEAT — the Worker stamps one on every scraped chunk
+#: it accepts — so a busy service is proving itself alive far more often than
+#: this, and this is what covers the quiet hour between two orders.
+WATCH_PING_EVERY_N_POLLS = 4
+
+#: The ping's own timeout, and it is deliberately short. Everything else this
+#: program says to the ledger is money and gets 120 seconds and three tries; this
+#: is a timestamp, it is repeated in twenty seconds, and a slow answer must never
+#: stand between a customer's order and the kitchen. See `ping_ledger`.
+WATCH_PING_TIMEOUT = 5.0
+
+#: THE DEADMAN: how far behind the loop may fall before this process kills itself
+#: so that something else can start it again.
+#:
+#: `go.py`, the phone's launcher, already restarts a collector that EXITS. The
+#: failure it cannot see is the one the owner actually had: the process alive, the
+#: log silent, the loop stuck inside a call that never came back — a network read
+#: blocking for ever despite its timeout, or Android suspending the thread. From
+#: outside, a hang and a healthy quiet afternoon look identical.
+#:
+#: Three times the poll interval is "we have missed several polls in a row", and
+#: the sixty-second floor is what keeps the default five-second gap from arming a
+#: fifteen-second hair trigger — one slow page on a phone's mobile data must not
+#: be a restart. At the default that is one minute of provable silence.
+DEADMAN_POLL_MULTIPLE = 3
+DEADMAN_FLOOR_SECONDS = 60.0
+
+#: How often the deadman thread wakes up to look at the clock. Cheap: a sleeping
+#: thread costs nothing, and this only bounds how late the diagnosis can be.
+DEADMAN_CHECK_SECONDS = 5.0
 
 DEFAULT_ENV_FILE = Path.home() / ".config" / "resto-ledger" / "collector.env"
 DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "resto-ledger"
@@ -1090,6 +1193,11 @@ class Throttle:
         self._last = 0.0
 
     def wait(self) -> None:
+        # Every request this program makes to the portal passes through here, so
+        # this is the cheapest honest place to say "still working" to the deadman
+        # — an import that legitimately takes minutes (a busy day's details, a
+        # sweep over a long window) keeps beating, and a call that hangs stops.
+        beat()
         now = time.monotonic()
         gap = self.interval - (now - self._last)
         if gap > 0:
@@ -1426,15 +1534,12 @@ def parse_order_details(payload: Any) -> tuple[str | None, str | None]:
     trailing spaces and double spaces. Either half alone is a name too: `first_name`
     with no surname is extremely common and is still what a cook calls out.
 
-    WHAT IS DELIBERATELY IGNORED. The response also carries `item_data` — the
-    per-dish rows with quantities, prices, sizes and add-ons that the report's
-    free-text `Item` cell does not have — plus `delivery_address`,
-    `delivery_charge`, `sub_total`, `comment` and `ebm`. All of it is left alone
-    here on purpose: the ledger's item rows come from `items_raw` today, both
-    writers of an order have to agree on the content hash, and quietly switching
-    one of them to a richer source is a change to what an order IS rather than an
-    addition to it. It is written down in the RUNBOOK as a thing that could be done
-    rather than half-done here.
+    WHAT IS DELIBERATELY IGNORED. The response also carries `delivery_address`,
+    `delivery_charge`, `sub_total`, `comment` and `ebm`. Every one of those facts
+    already reaches the ledger from the order LIST, and a second, differently
+    spelled copy of a number the books already have is how two writers start
+    disagreeing about one order. The dishes are the exception, and they have their
+    own parser below: the list has nothing like them.
     """
     if not isinstance(payload, dict):
         return None, None
@@ -1448,14 +1553,145 @@ def parse_order_details(payload: Any) -> tuple[str | None, str | None]:
     return (name or None), (phone or None)
 
 
+def _detail_int(value: Any) -> int | None:
+    """A portal number — `2`, `"2"`, `"3,000"` — as a whole one, or None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if not isinstance(value, str):
+        return None
+    text = collapse(value).upper().removesuffix("RWF").replace(",", "").replace(" ", "")
+    return int(text) if _INTEGER.match(text) else None
+
+
+def parse_order_items(payload: Any) -> list[dict[str, Any]] | None:
+    """
+    One `order_handler.php` response → the DISHES, or None when there is nothing
+    here this program is willing to call a dish list.
+
+    THIS FUNCTION NEVER RAISES either, and for `parse_order_details`' reason: what
+    it guards is a richer ticket, not a number in a ledger, and the order behind it
+    imports either way. None is the ordinary answer for a portal that changed shape
+    or an endpoint that answered with something else entirely, and the ledger's
+    fallback ladder (`item_data` → the parsed `Item` cell → the cell verbatim) is
+    what makes None cost a detail rather than a dinner.
+
+    ── ALL OR NOTHING, WHICH IS THE ONE RULE WORTH ARGUING ──────────────────────
+
+    A row this parser cannot read refuses the WHOLE list. Not the row: the list.
+    Dropping one dish would hand the kitchen a ticket that looks complete and is
+    short by a plate, and there is nothing on it that could tell a cook so — while
+    refusing the list drops the order back to exactly the ticket it would have got
+    last week. A missing add-on is the same argument one level down: the add-ons
+    ARE the order (`Choice of protein: Fish` is what makes it dinner rather than
+    rice), so a malformed one refuses the list too.
+
+    The QUANTITY is held to that same line and the PRICE is not, and the asymmetry
+    is deliberate. A quantity we cannot read is a structural claim we cannot make —
+    structure is the entire reason this endpoint is worth a second look at all — so
+    it refuses. A price is display-only, never reaches a kitchen ticket (the
+    owner's priceless-ticket rule) and is simply dropped when it will not parse: a
+    dish nobody can price is still a dish somebody has to cook.
+
+    ── THE SHAPE THAT GOES ON THE WIRE ─────────────────────────────────────────
+
+    The portal's names are translated once, here, into the ledger's:
+
+        {"name": "Party Jollof", "qty": 1, "size": "Large", "category": "Combos",
+         "notes": "no pepper", "price": 9000,
+         "addons": [{"name": "Fish", "category": "Choice of protein", "price": 0}]}
+
+    `name` and `qty` are always there; everything else is omitted when the portal
+    left it empty, which keeps the JSON well inside the ledger's ~8 KB column cap
+    on the biggest order this restaurant has ever taken. `worker/sync/vubavuba.ts`
+    shape-checks the same fields again on the way in — this program runs on
+    somebody's laptop and the server is not entitled to trust it.
+    """
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get("item_data")
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    def refuse(why: str) -> None:
+        LOG.warning("item_data ignored (%s) — the order imports with the list's Item cell", why)
+
+    if len(rows) > MAX_DETAIL_ITEMS:
+        refuse(f"{len(rows)} dishes, past the ceiling of {MAX_DETAIL_ITEMS}")
+        return None
+
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            refuse("a dish that is not an object")
+            return None
+
+        name = collapse(row.get("item_name")) if isinstance(row.get("item_name"), str) else ""
+        if not name:
+            refuse("a dish with no name")
+            return None
+
+        qty = _detail_int(row.get("quantity"))
+        if qty is None or qty <= 0:
+            refuse(f"{name}: cannot read {row.get('quantity')!r} as a quantity")
+            return None
+
+        item: dict[str, Any] = {"name": name, "qty": qty}
+        for key, source_key in (("size", "size"), ("category", "category_name"), ("notes", "notes")):
+            value = row.get(source_key)
+            text = collapse(value) if isinstance(value, str) else ""
+            if text:
+                item[key] = text
+        price = _detail_int(row.get("price"))
+        if price is not None and price >= 0:
+            item["price"] = price
+
+        addons_raw = row.get("addons")
+        if addons_raw is not None and not isinstance(addons_raw, list):
+            refuse(f"{name}: an addons field that is not a list")
+            return None
+        addons: list[dict[str, Any]] = []
+        if isinstance(addons_raw, list):
+            if len(addons_raw) > MAX_DETAIL_ADDONS:
+                refuse(f"{name}: {len(addons_raw)} add-ons, past the ceiling of {MAX_DETAIL_ADDONS}")
+                return None
+            for entry in addons_raw:
+                if not isinstance(entry, dict):
+                    refuse(f"{name}: an add-on that is not an object")
+                    return None
+                addon_name = collapse(entry.get("item_name")) if isinstance(entry.get("item_name"), str) else ""
+                if not addon_name:
+                    refuse(f"{name}: an add-on with no name")
+                    return None
+                addon: dict[str, Any] = {"name": addon_name}
+                category = entry.get("category_name")
+                if isinstance(category, str) and collapse(category):
+                    addon["category"] = collapse(category)
+                addon_price = _detail_int(entry.get("price"))
+                if addon_price is not None and addon_price >= 0:
+                    addon["price"] = addon_price
+                addons.append(addon)
+        if addons:
+            item["addons"] = addons
+
+        items.append(item)
+
+    return items
+
+
 @dataclass
-class CustomerFetch:
+class DetailFetch:
     """What one run's details fetching did, for the summary line."""
 
     #: Requests actually made. This IS the extra load on the portal.
     fetched: int = 0
     #: Of those, how many came back with a name.
     found: int = 0
+    #: Of those, how many came back with a dish list this program could read.
+    with_items: int = 0
     #: Fetches that failed or returned nothing usable. Never fails the run.
     failures: int = 0
     #: New orders left without a customer because the run hit its cap.
@@ -1466,15 +1702,23 @@ class CustomerFetch:
     first_payload: Any = None
 
 
-def fetch_customer_details(
+def fetch_order_details(
     portal: Portal,
     orders: Sequence[dict[str, Any]],
     detail_ids: dict[str, str],
     known_refs: dict[str, str],
-) -> CustomerFetch:
+) -> DetailFetch:
     """
-    Attach `customerName`/`customerPhone` to the orders this collector has never
-    seen before. MUTATES the order dicts, and never raises.
+    Attach `customerName`/`customerPhone` — and `itemData`, the dishes — to the
+    orders this collector has never seen before. MUTATES the order dicts, and never
+    raises.
+
+    ONE REQUEST CARRIES BOTH. The dishes were added in 2026-08-13 and cost the
+    portal nothing extra: `order_handler.php` was already being asked for the
+    customer, and `item_data` is in the answer it was already sending. That is the
+    whole reason this feature could be built at all without making the details
+    endpoint load-bearing — the budget, the cap and the never-retry rule below are
+    unchanged, and so is what a failure costs.
 
     ── WHY ONLY THE NEW ONES ────────────────────────────────────────────────────
     This is a SECOND request per order, against the same production server the
@@ -1486,12 +1730,14 @@ def fetch_customer_details(
     `known_refs` is the answer that survives a restart.
 
     ── WHAT A FAILURE COSTS, AND WHY IT IS NOT AN EXIT CODE ─────────────────────
-    Nothing but a name. Each fetch is wrapped on its own: a 500, an HTML error
-    page, a dropped connection or a payload we do not recognise leaves that one
-    order with no customer fields, is logged, and the run carries on and imports
-    the order exactly as it would have last week. The ledger takes both fields as
-    optional and never erases a stored one with a null, so a name missed today can
-    still land tomorrow if it is ever re-fetched.
+    A name and a richer ticket, and nothing else — THE LADDER LAW. Each fetch is
+    wrapped on its own: a 500, an HTML error page, a dropped connection or a
+    payload we do not recognise leaves that one order with no customer fields and
+    no `itemData`, is logged, and the run carries on and imports the order exactly
+    as it would have last week — the portal's free-text `Item` cell, parsed as it
+    always was. The ledger takes all three fields as optional and never erases a
+    stored one with a null, so what is missed today can still land tomorrow if it
+    is ever re-fetched.
 
     ── ONE EXCEPTION, AND IT IS NOT THIS FUNCTION'S ─────────────────────────────
     `AuthError` is re-raised. An expired session that `get_json`'s own re-login
@@ -1499,7 +1745,7 @@ def fetch_customer_details(
     to fail, and swallowing it here would spend the cap knocking on a door that has
     just been locked.
     """
-    result = CustomerFetch()
+    result = DetailFetch()
     # NEWEST FIRST: when the cap bites, it must bite on February's backfill and not
     # on this evening's orders. `orderTime` can be None on either side, hence `or ""`.
     new_orders = sorted(
@@ -1530,12 +1776,21 @@ def fetch_customer_details(
         except (CollectorError, requests.RequestException) as err:
             result.fetched += 1
             result.failures += 1
-            LOG.warning("no customer for %s — %s: %s", order["refNo"], type(err).__name__, err)
+            LOG.warning("no details for %s — %s: %s", order["refNo"], type(err).__name__, err)
             continue
 
         result.fetched += 1
         if result.first_payload is None:
             result.first_payload = payload
+
+        # THE DISHES FIRST, and outside the customer branch below on purpose: an
+        # order nobody left a name on is still an order with food in it, and an
+        # early `continue` here is exactly how a combo ticket would have gone on
+        # arriving empty for anonymous customers only.
+        items = parse_order_items(payload)
+        if items is not None:
+            order["itemData"] = items
+            result.with_items += 1
 
         name, phone = parse_order_details(payload)
         if name is None and phone is None:
@@ -1546,8 +1801,8 @@ def fetch_customer_details(
             LOG.info("%s: the details endpoint carried no customer", order["refNo"])
             continue
 
-        # Only what the ledger takes. The address, the line items and the comment
-        # stay where they are — see `parse_order_details`.
+        # Only what the ledger takes. The address and the money stay where they
+        # are — see `parse_order_details`.
         order["customerName"] = name
         order["customerPhone"] = phone
         if name is not None:
@@ -1561,10 +1816,11 @@ def fetch_customer_details(
             MAX_DETAIL_FETCHES_PER_RUN,
         )
     LOG.info(
-        "customer details: %d new ref(s), %d fetched, %d with a name, %d without",
+        "order details: %d new ref(s), %d fetched, %d with a name, %d with dishes, %d without",
         len(new_orders),
         result.fetched,
         result.found,
+        result.with_items,
         result.failures,
     )
     return result
@@ -1728,6 +1984,13 @@ def post_json(
 
     last = "no attempt was made"
     for attempt in range(1, attempts + 1):
+        # A REQUEST ABOUT TO BE MADE IS PROGRESS, and the deadman is told so here
+        # rather than only when the import finishes: three tries at a 120-second
+        # timeout is six minutes in the worst case, and a ledger having a slow
+        # morning must not be read as a hung phone and answered with a restart.
+        # A call that never returns still never beats again — which is the hang
+        # the deadman exists for. See `Deadman`.
+        beat()
         try:
             response = requests.post(url, json=payload, headers=headers, timeout=120)
         except requests.RequestException as err:
@@ -1750,6 +2013,44 @@ def post_json(
     raise ApiError(f"POST {path} failed after {attempts} attempts — {last}")
 
 
+def ping_ledger(cfg: Config, at: str | None = None) -> bool:
+    """
+    Tell the ledger this phone is still watching. ONE try, five seconds, no retry.
+
+    **NOTHING ABOUT THIS IS ALLOWED TO MATTER TO AN IMPORT.** It is the bottom
+    rung of the ladder: orders are the job, and a ping that cannot get out means
+    only that the counter may be told the phone has stopped when it has not. So
+    there is no retry ladder, no exception out of here, and no `ApiError` — a
+    failure is a `False` the caller counts and shrugs at.
+
+    THE TIMESTAMP IN THE BODY IS DIAGNOSTIC AND NOTHING ELSE. The Worker stamps
+    the beat with ITS OWN clock (`worker/routes/imports.ts`), because a phone
+    whose clock is wrong by an hour would otherwise be able to tell the ledger it
+    is fine while it is dead, or that it is dead while it is fine. This is what a
+    person reads in a log when they want to know what the phone believed the time
+    was.
+    """
+    url = f"{cfg.api_base}{HEARTBEAT_PATH}"
+    body = {"at": at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+    headers = {
+        "Content-Type": "application/json",
+        # The csrf guard covers /api/imports — the ping satisfies it exactly like
+        # the import does, because it lives under the same prefix on purpose.
+        "X-Requested-With": "fetch",
+        "X-Collector-Token": cfg.collector_token,
+        "User-Agent": USER_AGENT,
+    }
+    try:
+        response = requests.post(url, json=body, headers=headers, timeout=WATCH_PING_TIMEOUT)
+    except requests.RequestException as err:
+        LOG.debug("liveness ping did not reach %s — %s: %s", url, type(err).__name__, err)
+        return False
+    if 200 <= response.status_code < 300:
+        return True
+    LOG.debug("liveness ping → HTTP %d", response.status_code)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # The run
 # ---------------------------------------------------------------------------
@@ -1768,10 +2069,13 @@ class Summary:
     item_parse_failures: int = 0
     item_snapshot_rows: int = 0
     #: Extra GETs of the details endpoint this run made, and how many of them
-    #: produced a customer name. `details` IS the answer to "what does this
-    #: feature cost the portal", so it is on the one line a human reads.
+    #: produced a customer name and a dish list. `details` IS the answer to "what
+    #: does this feature cost the portal", so it is on the one line a human reads —
+    #: and it does not move when `dishes` starts appearing, because both ride the
+    #: same request.
     detail_fetches: int = 0
     customers: int = 0
+    dishes: int = 0
     exit_code: int = EXIT_OK
 
     def line(self) -> str:
@@ -1781,7 +2085,7 @@ class Summary:
             f"upserted={self.upserted} "
             f"unchanged={self.unchanged} status_changes={self.status_changes} "
             f"item_parse_failures={self.item_parse_failures} item_snapshot={self.item_snapshot_rows} "
-            f"details={self.detail_fetches} customers={self.customers} "
+            f"details={self.detail_fetches} customers={self.customers} dishes={self.dishes} "
             f"exit={self.exit_code}"
         )
 
@@ -1887,18 +2191,20 @@ def run(cfg: Config, args: argparse.Namespace, portal: Portal | None = None) -> 
             sorted(set(scraped.unknown_payment_types)),
         )
 
-    # THE CUSTOMER, FOR THE ORDERS THAT ARE NEW TO US, AND ONLY THEM. One extra
-    # GET each, inside the same run that is about to POST them — so a watch-mode
-    # poll that found nothing new costs the details endpoint nothing at all, which
-    # is the whole reason `known_refs` is on disk rather than in this function.
+    # THE CUSTOMER AND THE DISHES, FOR THE ORDERS THAT ARE NEW TO US, AND ONLY
+    # THEM. ONE extra GET each — both facts come out of the same response — inside
+    # the same run that is about to POST them, so a watch-mode poll that found
+    # nothing new costs the details endpoint nothing at all, which is the whole
+    # reason `known_refs` is on disk rather than in this function.
     #
     # Deliberately BEFORE the item snapshot and the dry-run print: the fields it
     # attaches are part of the payload, so `--dry-run` has to show them or it is
     # not showing what a real run would send.
     known_refs = load_known_refs()
-    customers = fetch_customer_details(portal, scraped.orders, scraped.detail_ids, known_refs)
+    customers = fetch_order_details(portal, scraped.orders, scraped.detail_ids, known_refs)
     summary.detail_fetches = customers.fetched
     summary.customers = customers.found
+    summary.dishes = customers.with_items
 
     items, summary_html = scrape_item_summary(portal, end)
     summary.item_snapshot_rows = len(items)
@@ -2056,6 +2362,153 @@ class WatchStop:
         return bool(self.reason)
 
 
+# ---------------------------------------------------------------------------
+# The deadman — a hang becomes a crash, and a crash is already handled
+# ---------------------------------------------------------------------------
+
+
+def deadman_limit(poll_seconds: float) -> float:
+    """How long a silent loop is allowed to be. `DEADMAN_*` carries the reasoning."""
+    return max(DEADMAN_POLL_MULTIPLE * float(poll_seconds), DEADMAN_FLOOR_SECONDS)
+
+
+class Deadman:
+    """
+    A daemon thread that kills this process if the loop stops making progress.
+
+    ── WHY A PROCESS KILLS ITSELF ──────────────────────────────────────────────
+
+    Every other failure in this program is already automatic: a network error
+    backs off, an expired session logs back in, a crashed process is restarted by
+    the phone's launcher in thirty seconds. The one the ladder does not cover is a
+    HANG — the process alive, the loop stuck inside a call that never returns —
+    because from outside it is indistinguishable from a quiet afternoon and
+    nothing ever fires. That was the owner's actual outage: a phone on a charger,
+    a screen that said "watching for orders", and no orders reaching the counter.
+    Nothing INSIDE a hung thread can rescue it (a blocked C-level read cannot be
+    interrupted from Python), so the only automatic move left is to end the
+    process and let whatever started it start it again.
+
+    ── WHAT COUNTS AS PROGRESS ─────────────────────────────────────────────────
+
+    A completed poll, first of all — that is the loop's own pulse. But also every
+    portal request (`Throttle.wait`), every ledger POST attempt (`post_json`) and
+    every piece of a deliberate wait (`_watch_sleep`), because a long import and a
+    five-minute backoff are the program working rather than the program stuck. A
+    call that hangs beats NOTHING, whichever of those it is inside, which is
+    exactly the property that makes this a hang detector and not a timeout on
+    slowness.
+
+    ── `time.monotonic`, AND WHY IT IS THE RIGHT CLOCK HERE ────────────────────
+
+    It does not run while the device is suspended, and that is the behaviour we
+    want: a phone whose whole process Android froze for ten minutes has not hung,
+    and thawing it into an immediate suicide would turn power management into an
+    outage. What DOES advance it is a frozen main thread beside a live one — the
+    Pydroid failure this exists to catch.
+
+    ── `os._exit`, AND NOT `sys.exit` ──────────────────────────────────────────
+
+    `sys.exit` raises `SystemExit` **in the calling thread** — here, this monitor
+    thread — where it kills nothing but the monitor and leaves the hang in place.
+    `os._exit` ends the interpreter immediately, without unwinding and without
+    waiting for a lock the hung thread may be holding. That is the whole point:
+    there is nothing to clean up that is worth waiting on, and every write this
+    program makes is an idempotent upsert the next run converges on.
+    """
+
+    def __init__(self, limit: float, clock: Any = time.monotonic) -> None:
+        self.limit = float(limit)
+        self._clock = clock
+        self._last = clock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def beat(self) -> None:
+        """Progress. Called from four places; see the class docstring."""
+        self._last = self._clock()
+
+    def silent_for(self) -> float:
+        return self._clock() - self._last
+
+    def overdue(self) -> bool:
+        return self.silent_for() > self.limit
+
+    def check(self) -> bool:
+        """Look once. Returns True — and does not return at all — if it tripped."""
+        if not self.overdue():
+            return False
+        self.trip()
+        return True
+
+    def trip(self) -> None:
+        """
+        Say what happened, loudly and with the evidence, then end the process.
+
+        The stack of EVERY thread, not just the main one, because "which call did
+        it stop in" is the entire diagnosis and the answer is as likely to be in a
+        `requests` read as in this file. It goes through the ordinary log, which
+        on the phone is a file somebody can be talked through opening.
+        """
+        LOG.critical(
+            "THE WATCH LOOP HAS HUNG — no progress for %.0fs (limit %.0fs). "
+            "Killing this process so the launcher can start a fresh one; "
+            "every write this program makes is an idempotent upsert, so nothing is lost.",
+            self.silent_for(),
+            self.limit,
+        )
+        LOG.critical("what every thread was doing:\n%s", thread_dump())
+        os._exit(EXIT_HANG)
+
+    def start(self) -> "Deadman":
+        self.beat()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="deadman", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        """Stand the monitor down. The loop is ending on purpose, so it is not a hang."""
+        self._stop.set()
+
+    def _loop(self) -> None:
+        # `Event.wait` and not `time.sleep`, so a clean shutdown does not have to
+        # wait out the last check interval.
+        while not self._stop.wait(DEADMAN_CHECK_SECONDS):
+            self.check()
+
+
+def thread_dump() -> str:
+    """Every thread, and where it is. The one thing worth having about a hang."""
+    frames = sys._current_frames()
+    lines: list[str] = []
+    for thread in threading.enumerate():
+        lines.append(f"--- {thread.name} (daemon={thread.daemon}) ---")
+        frame = frames.get(thread.ident or -1)
+        if frame is None:
+            lines.append("    (no frame — the thread ended while we were looking)")
+            continue
+        lines.extend(piece.rstrip() for piece in traceback.format_stack(frame))
+    return "\n".join(lines)
+
+
+#: The deadman the watch loop armed, or None everywhere else.
+#:
+#: A module-level one rather than an argument threaded through `run`, `Portal` and
+#: `post_json`: the beat has to be reachable from the bottom of the call stack,
+#: and adding a parameter to five functions so that four of them can pass it
+#: along untouched is how a small safety net becomes a refactor. One-shot runs
+#: leave it None and `beat()` is a no-op for them — they have launchd, a fixed
+#: end, and no loop to hang.
+_deadman: Deadman | None = None
+
+
+def beat() -> None:
+    """Progress, from anywhere. A no-op outside watch mode."""
+    if _deadman is not None:
+        _deadman.beat()
+
+
 def _watch_sleep(seconds: float, stop: WatchStop, sleeper: Any) -> None:
     """
     Sleep, in pieces, so a signal is answered in seconds rather than at dawn.
@@ -2065,12 +2518,54 @@ def _watch_sleep(seconds: float, stop: WatchStop, sleeper: Any) -> None:
     through the night would take the SIGTERM, set the flag, and then go back to
     sleep for another seven hours with nobody left to notice. Chopping the wait
     into `WATCH_SLEEP_CHUNK` pieces bounds how long the flag can go unread.
+
+    Each piece also BEATS THE DEADMAN, because a deliberate wait is not a hang: a
+    five-minute backoff against a portal that is down, and the seven-hour sleep
+    through the night, are both this loop working exactly as designed. What the
+    deadman is looking for is a wait nobody chose.
     """
     remaining = float(seconds)
     while remaining > 0 and not stop:
+        beat()
         nap = min(WATCH_SLEEP_CHUNK, remaining)
         sleeper(nap)
         remaining -= nap
+
+
+def _pinged(cfg: Config, streak: int) -> int:
+    """
+    Ping the ledger; say how long the failing streak is now. **NEVER RAISES.**
+
+    THE LADDER LAW IS THIS FUNCTION. A ping is the bottom rung — below the
+    orders, below the session, below everything a customer can feel — so it is
+    written so that no failure of it can reach the loop that imports. The second
+    `try` is not superstition: `ping_ledger` swallows its own network errors, and
+    this one is the promise that a LATER bug in it still cannot cost anybody an
+    order.
+
+    ONE LINE PER STREAK, not one per ping. A ledger that is unreachable for an
+    hour is 180 pings; a warning each would bury the line that says why. So the
+    first failure says so, the rest are silent, and the recovery says how many
+    there were — which is also the only line that tells a reader whether the
+    counter was being told this phone had stopped.
+    """
+    try:
+        ok = ping_ledger(cfg)
+    except Exception as err:  # noqa: BLE001 - an order must never be lost to a ping
+        LOG.debug("the liveness ping raised (%s: %s) — ignored", type(err).__name__, err)
+        ok = False
+
+    if ok:
+        if streak:
+            LOG.info("the ledger is hearing this phone again (after %d ping(s) it did not)", streak)
+        return 0
+    if streak == 0:
+        LOG.warning(
+            "the liveness ping is not reaching %s — the counter may be told this phone has stopped. "
+            "Orders are unaffected: imports use their own retries.",
+            cfg.api_base,
+        )
+    return streak + 1
 
 
 def watch(
@@ -2079,6 +2574,7 @@ def watch(
     portal: Portal | None = None,
     sleeper: Any = time.sleep,
     stop: WatchStop | None = None,
+    deadman: Deadman | None = None,
 ) -> int:
     """
     Log in once; re-read the recent window every ~10s; import only what changed.
@@ -2122,7 +2618,25 @@ def watch(
     has genuinely changed shape is retried on the sweep timer rather than on
     every poll — a few dumps an hour instead of one every ten seconds, until the
     human they are addressed to reads one. Nothing is imported from any of them.
+
+    WHAT IT SAYS ABOUT ITSELF, AND WHAT KILLS IT (2026-08-14). Two additions, both
+    for the same outage: a phone that stops watching and nobody finds out until
+    the morning's orders are missing.
+
+      * every fourth completed poll POSTs a one-line liveness ping to the ledger
+        (`ping_ledger`), so the Worker's hub can tell "watching" from "stopped"
+        within seconds and ring the counter with the instructions when it stops;
+      * a `Deadman` thread turns a HANG into an exit, because an exit is the one
+        failure the phone's launcher already knows how to fix. Thirty seconds
+        later there is a fresh process; without it there is a phone on a charger
+        showing "watching for orders" and importing nothing.
+
+    Neither can affect an import. The ping cannot raise into the loop and is never
+    retried; the deadman is beaten by every request and every deliberate wait, so
+    only a wait nobody chose can trip it.
     """
+    global _deadman
+
     stop = stop if stop is not None else WatchStop()
     portal = portal or Portal(cfg)
     poll_seconds = max(WATCH_POLL_FLOOR, float(cfg.watch_poll_seconds))
@@ -2132,6 +2646,7 @@ def watch(
     backoff = WATCH_BACKOFF_START
     polls = 0
     failures = 0
+    ping_streak = 0
     last_change: datetime | None = None
     since_heartbeat = 0.0
     # Due immediately: the first poll of a session has nothing to compare against
@@ -2147,101 +2662,129 @@ def watch(
         ACTIVE_HOUR_TO,
     )
 
-    while not stop:
-        shut_for = seconds_until_active()
-        if shut_for > 0:
-            # ONE line for the whole night, not one per poll. The alternative is
-            # 4,000 lines of "closed" between midnight and seven, which is how
-            # the morning's real messages become unfindable.
-            LOG.info(
-                "the restaurant is shut — sleeping %s, until %02d:00 Kigali",
-                _duration(shut_for),
-                ACTIVE_HOUR_FROM,
-            )
-            _watch_sleep(shut_for, stop, sleeper)
-            # Nothing that happened before the night is worth carrying past it:
-            # open with a complete read and a fresh hour on the heartbeat.
-            since_sweep = WATCH_SWEEP_SECONDS
-            since_heartbeat = 0.0
-            continue
+    # ARMED HERE AND NOWHERE ELSE, and stood down in the `finally` below, because
+    # the module-level handle is what `beat()` reaches from the bottom of the call
+    # stack. A monitor left armed after this function returns would be a thread
+    # watching a clock nobody winds any more — and thirty to sixty seconds later
+    # it would kill a perfectly healthy process for a loop that ended on purpose.
+    monitor = deadman if deadman is not None else Deadman(deadman_limit(poll_seconds))
+    _deadman = monitor
+    monitor.start()
+    LOG.info("deadman armed: %.0fs without progress ends this process (the launcher restarts it)", monitor.limit)
+    try:
+        while not stop:
+            shut_for = seconds_until_active()
+            if shut_for > 0:
+                # ONE line for the whole night, not one per poll. The alternative is
+                # 4,000 lines of "closed" between midnight and seven, which is how
+                # the morning's real messages become unfindable.
+                LOG.info(
+                    "the restaurant is shut — sleeping %s, until %02d:00 Kigali",
+                    _duration(shut_for),
+                    ACTIVE_HOUR_FROM,
+                )
+                _watch_sleep(shut_for, stop, sleeper)
+                # Nothing that happened before the night is worth carrying past it:
+                # open with a complete read and a fresh hour on the heartbeat.
+                since_sweep = WATCH_SWEEP_SECONDS
+                since_heartbeat = 0.0
+                continue
 
-        wait = poll_seconds
-        fresh: str | None = None
-        try:
-            if not logged_in:
-                # ONCE per session. Everything after this rides the cookie, and
-                # the mid-session expiry the portal does on its own schedule is
-                # handled a layer down, inside `get_json`.
-                portal.login()
-                logged_in = True
+            wait = poll_seconds
+            fresh: str | None = None
+            try:
+                if not logged_in:
+                    # ONCE per session. Everything after this rides the cookie, and
+                    # the mid-session expiry the portal does on its own schedule is
+                    # handled a layer down, inside `get_json`.
+                    portal.login()
+                    logged_in = True
 
-            start, end = window_for(args, cfg, kigali_now().date())
-            payload = portal.get_json(ORDERS_API_PATH, orders_params(1, start, end))
-            polls += 1
+                start, end = window_for(args, cfg, kigali_now().date())
+                payload = portal.get_json(ORDERS_API_PATH, orders_params(1, start, end))
+                polls += 1
+                # A COMPLETED POLL IS THE LOOP'S OWN PULSE — the beat the deadman
+                # is really about, and the one place it is impossible to reach
+                # without having gone all the way out to the portal and back.
+                beat()
+                # …and every fourth one, out to the ledger, so the counter can be
+                # told within seconds when this stops. OUTSIDE the failure ladder
+                # by construction: `_pinged` returns rather than raising, so a
+                # ledger that cannot be reached costs a log line and never a
+                # backoff, a re-login or one order's delay. See `ping_ledger`.
+                if polls % WATCH_PING_EVERY_N_POLLS == 0:
+                    ping_streak = _pinged(cfg, ping_streak)
 
-            fresh = poll_digest(payload)
-            changed = fresh != digest
-            due_sweep = since_sweep >= WATCH_SWEEP_SECONDS
-            if changed or due_sweep:
-                if changed:
-                    last_change = kigali_now()
+                fresh = poll_digest(payload)
+                changed = fresh != digest
+                due_sweep = since_sweep >= WATCH_SWEEP_SECONDS
+                if changed or due_sweep:
+                    if changed:
+                        last_change = kigali_now()
+                    else:
+                        LOG.info("watch sweep: re-reading %s..%s even though page 1 has not moved", start, end)
+                    # Reset BEFORE the read, not after. The sweep is a timer on how
+                    # long the one-page poll may be trusted on its own, and a read
+                    # that failed still spent that trust; what decides whether a
+                    # failed import is retried is the digest, which is the thing that
+                    # knows if anything is outstanding. Resetting afterwards would
+                    # mean a drifted portal re-reading, re-failing and re-dumping on
+                    # every single poll, because the sweep would never come due.
+                    since_sweep = 0.0
+                    summary = run(cfg, args, portal)
+                    LOG.info("%s", summary.line())
+                    digest = fresh
+
+                failures = 0
+                backoff = WATCH_BACKOFF_START
+            except Exception as err:  # noqa: BLE001 - the loop outlives everything below it
+                if isinstance(err, (PortalDrift, PaginationError)) and fresh is not None:
+                    # This exact payload has already been dumped and logged. Reading
+                    # it again on every poll produces another identical dump and
+                    # tells nobody anything they did not know at the first one, so it
+                    # drops back to the sweep timer. The next genuine change to the
+                    # window gets a fresh look and, if it is still broken, a fresh
+                    # dump.
+                    digest = fresh
+                if isinstance(err, AuthError):
+                    # The session is gone in a way `get_json`'s own re-login could not
+                    # fix. Start the next attempt from a clean login rather than from
+                    # a cookie we have already watched fail.
+                    logged_in = False
+                if isinstance(err, CollectorError):
+                    LOG.error("%s", err)
                 else:
-                    LOG.info("watch sweep: re-reading %s..%s even though page 1 has not moved", start, end)
-                # Reset BEFORE the read, not after. The sweep is a timer on how
-                # long the one-page poll may be trusted on its own, and a read
-                # that failed still spent that trust; what decides whether a
-                # failed import is retried is the digest, which is the thing that
-                # knows if anything is outstanding. Resetting afterwards would
-                # mean a drifted portal re-reading, re-failing and re-dumping on
-                # every single poll, because the sweep would never come due.
-                since_sweep = 0.0
-                summary = run(cfg, args, portal)
-                LOG.info("%s", summary.line())
-                digest = fresh
+                    LOG.exception("unexpected failure in the watch loop: %s", err)
+                failures += 1
+                wait = backoff
+                backoff = min(backoff * 2, WATCH_BACKOFF_MAX)
+                LOG.warning(
+                    "backing off %s before the next poll (%d consecutive failure(s))",
+                    _duration(wait),
+                    failures,
+                )
 
-            failures = 0
-            backoff = WATCH_BACKOFF_START
-        except Exception as err:  # noqa: BLE001 - the loop outlives everything below it
-            if isinstance(err, (PortalDrift, PaginationError)) and fresh is not None:
-                # This exact payload has already been dumped and logged. Reading
-                # it again on every poll produces another identical dump and
-                # tells nobody anything they did not know at the first one, so it
-                # drops back to the sweep timer. The next genuine change to the
-                # window gets a fresh look and, if it is still broken, a fresh
-                # dump.
-                digest = fresh
-            if isinstance(err, AuthError):
-                # The session is gone in a way `get_json`'s own re-login could not
-                # fix. Start the next attempt from a clean login rather than from
-                # a cookie we have already watched fail.
-                logged_in = False
-            if isinstance(err, CollectorError):
-                LOG.error("%s", err)
-            else:
-                LOG.exception("unexpected failure in the watch loop: %s", err)
-            failures += 1
-            wait = backoff
-            backoff = min(backoff * 2, WATCH_BACKOFF_MAX)
-            LOG.warning(
-                "backing off %s before the next poll (%d consecutive failure(s))",
-                _duration(wait),
-                failures,
-            )
+            since_heartbeat += wait
+            since_sweep += wait
+            if since_heartbeat >= WATCH_HEARTBEAT_SECONDS:
+                LOG.info(
+                    "watch alive, %d polls, last change %s",
+                    polls,
+                    last_change.strftime("%H:%M") if last_change else "none yet",
+                )
+                since_heartbeat = 0.0
 
-        since_heartbeat += wait
-        since_sweep += wait
-        if since_heartbeat >= WATCH_HEARTBEAT_SECONDS:
-            LOG.info(
-                "watch alive, %d polls, last change %s",
-                polls,
-                last_change.strftime("%H:%M") if last_change else "none yet",
-            )
-            since_heartbeat = 0.0
+            _watch_sleep(wait, stop, sleeper)
 
-        _watch_sleep(wait, stop, sleeper)
-
-    LOG.info("watch stopped (%s) after %d poll(s)", stop.reason, polls)
-    return EXIT_OK
+        LOG.info("watch stopped (%s) after %d poll(s)", stop.reason, polls)
+        return EXIT_OK
+    finally:
+        # A loop that ended — on a signal, on an exception on its way out to
+        # `main` — is not a hang, and the monitor must not outlive it. The global
+        # is cleared too, so `beat()` from a one-shot run in the same process
+        # (the phone's launcher calls `main` in a loop) is the no-op it should be.
+        monitor.stop()
+        _deadman = None
 
 
 def build_parser() -> argparse.ArgumentParser:
