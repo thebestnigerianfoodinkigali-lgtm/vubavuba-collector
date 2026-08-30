@@ -372,7 +372,12 @@ MAX_DETAIL_ADDONS = 20
 #: BEST-EFFORT IN BOTH DIRECTIONS. Losing it costs one window's worth of re-asked
 #: details (idempotent, and the ledger's COALESCE means a second answer is harmless);
 #: failing to write it must never fail a run that has already imported.
-KNOWN_REFS_FILE = "customer-details-seen.json"
+# _v2 on 2026-08-30: the customerJson capture shipped and every ref in the window
+# must be re-asked ONCE so orders the old build already "knew" (their name, not
+# their json_details) get the blob too. A new filename is this file's own escape
+# hatch — "a missing file is the first run", one window of idempotent re-asks,
+# COALESCE makes every second answer harmless. The old file is left to rot.
+KNOWN_REFS_FILE = "customer-details-seen-v2.json"
 
 #: How long a ref stays remembered. Long enough that a `--full` backfill and every
 #: ordinary window are covered, short enough that the file stays a few hundred
@@ -1888,6 +1893,24 @@ def fetch_order_details(
         if items is not None:
             order["itemData"] = items
             result.with_items += 1
+
+        # THE ONE KEY WE USED TO IGNORE (2026-08-30). `contact_phone` turned out to
+        # answer with the SHOP'S OWN number on 94 orders under 67 different names —
+        # the owner asked for a customer's number and got his own back — so the
+        # portal's `json_details` blob now rides along verbatim-compact, because it
+        # is the last place the customer's real number can still live. Same ladder
+        # law as everything else here: unreadable means absent, never a failure.
+        raw_details = payload.get("json_details") if isinstance(payload, dict) else None
+        customer_json = None
+        if isinstance(raw_details, str):
+            customer_json = collapse(raw_details)[:4000] or None
+        elif isinstance(raw_details, (dict, list)):
+            try:
+                customer_json = json.dumps(raw_details, separators=(",", ":"))[:4000]
+            except (TypeError, ValueError):
+                customer_json = None
+        if customer_json is not None:
+            order["customerJson"] = customer_json
 
         name, phone = parse_order_details(payload)
         if name is None and phone is None:
