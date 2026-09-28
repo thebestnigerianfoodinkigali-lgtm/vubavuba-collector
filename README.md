@@ -60,8 +60,15 @@ only what the ledger hands it:
   `{by, ok, http, message}`, message ≤200 characters with secrets redacted); a
   report that cannot get out is logged and the ledger re-hands the row a minute
   later.
-* One log line per action: `action accept #<ref> → success` or
-  `→ refused: <message>`. The cookie and the credentials are never logged.
+* One log line per action: `action accept #<ref> (portal_id) → success` or
+  `→ refused: <message>` (the bracket is which id the ledger sent, left off when
+  it named none). The cookie and the credentials are never logged.
+* **The row id rides with every order as `portal_id`** (VV-2 fix 1): each order
+  the collector imports carries the id from its row's `openEditStatusModal(<id>)`
+  link, as text (a row with no Edit link leaves the key off — never null or
+  empty). The ledger keeps it and hands it back as the `order_id` to press
+  (`id_source: "portal_id"`, or the Ref# with `id_source: "ref_no"` for an order
+  it has no row id for). The collector presses that `order_id` exactly as sent.
 
 The phone's `--watch` presses after each fourth poll's beat, as `phone`. The
 Actions one-shot beats once **at the end** of a run that worked, presses,

@@ -1198,6 +1198,28 @@ def detail_id_of(actions_cell: Any) -> str | None:
     return match.group(1) if match else None
 
 
+#: The id inside the row's own **Edit** link: `onclick='openEditStatusModal(2915384)'`
+#: — the button a human presses to change the status, so the id `order_handler.php`'s
+#: `update_status` wants. Quotes tolerated for the same reason as the Details link's.
+_EDIT_STATUS_ID = re.compile(r"openEditStatusModal\(\s*['\"]?(\d+)['\"]?\s*\)")
+
+
+def portal_id_of(actions_cell: Any) -> str | None:
+    """
+    The portal's own row id for this order (VV-2 fix 1, ADR-130), as text, or None.
+
+    It rides with the order as `portal_id`; the ledger stores it (COALESCE — never
+    blanked by a later silence) and hands it back in the heartbeat as the
+    `order_id` to press, with `id_source:"portal_id"`. READ OUT OF THE ROW, like
+    the Details id: it equals the Ref# in every probe so far, and that is exactly
+    why it must not be assumed. A row with no Edit link returns None and the key
+    is left off the order — absent tells the ledger "leave what you have", where
+    null or "" would be a claim this program cannot make.
+    """
+    match = _EDIT_STATUS_ID.search(str(actions_cell))
+    return match.group(1) if match else None
+
+
 def status_cell_text(cell: Any, row_no: int) -> str:
     """
     The Status cell → `"successful"`, read out of the badge that marks it.
@@ -1254,6 +1276,11 @@ def parse_orders_rows(orders_html: str) -> tuple[list[dict[str, Any]], list[str]
         text[COL_STATUS] = status_cell_text(cells[COL_STATUS], row_no)
 
         order, unknown_payment = normalize_report_row(text, row_no)
+        # VV-2 fix 1: unlike the Details id below, this one IS a field of the order —
+        # the ledger keeps it and hands it back for pressing Accept / Ready for pickup.
+        portal_id = portal_id_of(cells[COL_ACTIONS])
+        if portal_id is not None:
+            order["portal_id"] = portal_id
         orders.append(order)
         if unknown_payment:
             unknown.append(unknown_payment)
@@ -2331,6 +2358,10 @@ class PortalAction:
     ref_no: str | None
     action: str
     status_value: str
+    #: Which id `order_id` is (VV-2 fix 1): `portal_id` (the row's own link id) or
+    #: `ref_no` (the ledger had none stored). Logged, never acted on — the press uses
+    #: `order_id` exactly as sent. Anything else is None.
+    id_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2399,9 +2430,19 @@ def parse_heartbeat_actions(body: Any) -> tuple[list[PortalAction], list[str]]:
                 ref_no=item.get("ref_no"),
                 action=item["action"],
                 status_value=item["status_value"],
+                id_source=_known_id_source(item.get("id_source")),
             )
         )
     return actions, problems
+
+
+#: The two answers the ledger gives for which id an action's `order_id` is (ADR-130).
+ACTION_ID_SOURCES = ("portal_id", "ref_no")
+
+
+def _known_id_source(raw: Any) -> str | None:
+    """`id_source` as the ledger named it, or None for absent/unknown — never a refusal."""
+    return raw if raw in ACTION_ID_SOURCES else None
 
 
 def ping_ledger(cfg: Config, at: str | None = None, by: str = RUNNER_PHONE) -> Beat:
@@ -2601,9 +2642,10 @@ def perform_actions(portal: Portal, cfg: Config, actions: Sequence[PortalAction]
             if outcome.ok:
                 pressed += 1
             LOG.info(
-                "action %s #%s → %s",
+                "action %s #%s%s → %s",
                 action.action,
                 action.ref_no or action.order_id,
+                f" ({action.id_source})" if action.id_source in ACTION_ID_SOURCES else "",
                 "success" if outcome.ok else f"refused: {outcome.message or 'no message'}",
             )
             report_action_result(cfg, action.id, by, outcome)
