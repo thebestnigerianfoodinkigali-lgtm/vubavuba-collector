@@ -98,7 +98,8 @@ WHAT THIS PROGRAM PROMISES
 
 EXIT CODES — launchd and a human read these.
 
-    0  ok, or "not now" (outside 07:00-23:00 Kigali; nothing to do)
+    0  ok, or "not now" (outside COLLECTOR_ACTIVE_HOURS, if any were set — the
+       default is all day, because the restaurant trades 24 hours)
     1  unexpected error, including a pagination loop that would not end (a bug here)
     2  configuration problem (missing file, wrong permissions, missing key)
     3  authentication failed (the message says wrong credentials vs portal change)
@@ -384,9 +385,22 @@ KNOWN_REFS_FILE = "customer-details-seen-v2.json"
 #: lines rather than growing for ever. Pruned by the order's own date on every save.
 KNOWN_REFS_KEEP_DAYS = 30
 
-#: Kigali hours in which a run is worth doing at all.
-ACTIVE_HOUR_FROM = 7
-ACTIVE_HOUR_TO = 23
+#: KIGALI HOURS IN WHICH A RUN IS WORTH DOING AT ALL — and since the restaurant
+#: went to 24-hour service (2026-09-28) the answer is every one of them.
+#:
+#: This used to be 07:00–23:59, hard-coded, and the collector slept through the
+#: rest: the one-shot exited 0 "the restaurant is shut" and the watch loop took
+#: one long sleep until seven. Once the kitchen trades all night that sleep is a
+#: bug with a clock on it — an order placed at 02:00 reached the counter at 07:00.
+#:
+#: So the hours are a SETTING, `COLLECTOR_ACTIVE_HOURS=H-H` (inclusive Kigali
+#: hours: `7-23` is 07:00 to 23:59, the old behaviour exactly; `22-6` wraps
+#: midnight), read from the environment or else the credentials file, ONCE, by
+#: `load_config`. Unset means all day. A value that does not parse means all day
+#: too, with one WARNING quoting it — a typo must fail towards collecting, not
+#: towards a kitchen that hears nothing all night.
+ACTIVE_HOURS_ENV = "COLLECTOR_ACTIVE_HOURS"
+ACTIVE_HOURS_DEFAULT = (0, 23)
 
 #: `--watch`: how often to re-read the window, and the floor under it. Both are
 #: seconds, and the default now SITS ON the floor.
@@ -400,9 +414,10 @@ ACTIVE_HOUR_TO = 23
 #: The owner's complaint after a week of live use was that the counter learns
 #: about a Vubavuba order roughly ten seconds after the rider's app does, and in
 #: that ten seconds a customer is standing at a till nobody has told. Halving the
-#: gap costs, over the 17 active hours (07:00–23:59, `ACTIVE_HOUR_*`):
+#: gap costs, now that the restaurant trades 24 hours (`ACTIVE_HOURS_DEFAULT`):
 #:
-#:     61,200 s ÷ 5 s  ≈  12,000 portal reads a day   (was ≈ 6,000 at ten)
+#:     86,400 s ÷ 5 s  ≈  17,000 portal reads a day   (≈ 12,000 when the collector
+#:                                                      slept 00:00–07:00)
 #:
 #: which is one request every five seconds from ONE logged-in session — about what
 #: a human refreshing a dashboard with a hand on F5 produces, and the shape is what
@@ -413,9 +428,8 @@ ACTIVE_HOUR_TO = 23
 #:
 #: ── THE TWO-SECOND ASK IS REFUSED, AND THIS IS THE REASON ──────────────────
 #:
-#: Two seconds is ≈ 31,000 reads over the same hours — and ≈ 43,000 a day if
-#: anybody ever removed the night skip — which stops looking like somebody
-#: watching a screen and starts looking like a bot hammering a login-gated
+#: Two seconds is ≈ 43,000 reads a day around the clock, which stops looking like
+#: somebody watching a screen and starts looking like a bot hammering a login-gated
 #: endpoint. It also stops buying anything: the request and the one-per-second
 #: throttle already put a second or two under every poll, so the real gain from
 #: 5 s to 2 s is about three seconds of freshness in exchange for two and a half
@@ -451,8 +465,9 @@ WATCH_HEARTBEAT_SECONDS = 3600.0
 
 #: `--watch`: the longest a sleep may ignore a signal. Every wait in watch mode
 #: is chopped into pieces this size, because PEP 475 makes `time.sleep` RESUME
-#: after a handler returns — an eight-hour night sleep would swallow the SIGTERM
-#: that was meant to stop it, and the operator would be left holding Ctrl-C.
+#: after a handler returns — a long sleep outside `COLLECTOR_ACTIVE_HOURS` (when
+#: any are set) would swallow the SIGTERM that was meant to stop it, and the
+#: operator would be left holding Ctrl-C.
 WATCH_SLEEP_CHUNK = 5.0
 
 #: WHERE THE LIVENESS PING GOES, and the ONE thing it is for: so the ledger can
@@ -465,15 +480,17 @@ WATCH_SLEEP_CHUNK = 5.0
 HEARTBEAT_PATH = "/api/imports/vubavuba/heartbeat"
 
 #: One ping every fourth completed poll — about one every 20-25 seconds at the
-#: five-second gap, against the Worker's ">90 seconds of silence is an outage"
-#: rule. Three or four pings have to go missing before anybody is told, which is
-#: what keeps one dropped packet on a phone's wifi from ringing the counter.
+#: five-second gap, against the Worker's "more than seven minutes of silence is an
+#: outage" rule. Twenty-odd pings have to go missing before anybody is told, which
+#: is what keeps one dropped packet on a phone's wifi — or a restart that worked —
+#: from ringing the counter.
 #:
 #: FOUR AND NOT ONE. A ping per poll is ~12,000 extra requests a day against the
 #: Workers Free plan's 100,000 for the whole account (ADR-022 does that
 #: arithmetic for the sockets) — real money's worth of budget for freshness
 #: nobody can perceive. Four is ~3,000 a day, and the detection window it buys is
-#: still inside the owner's "within about thirty seconds".
+#: far finer than the Worker's threshold, which waits out this phone's own
+#: automatic restarts on purpose (ADR-029, amended).
 #:
 #: AN IMPORT IS ALSO A HEARTBEAT — the Worker stamps one on every scraped chunk
 #: it accepts — so a busy service is proving itself alive far more often than
@@ -592,6 +609,9 @@ class Config:
     #: `--watch` only, and the one switch in this file that turns a safety net OFF.
     #: `DEADMAN=0` in the credentials file; `load_config` carries the reasoning.
     deadman_enabled: bool = True
+    #: Inclusive Kigali hours `(from, to)` in which to work. All day unless
+    #: `COLLECTOR_ACTIVE_HOURS` says otherwise — see `ACTIVE_HOURS_DEFAULT`.
+    active_hours: tuple[int, int] = ACTIVE_HOURS_DEFAULT
 
     @property
     def secrets(self) -> tuple[str, ...]:
@@ -619,6 +639,48 @@ def _parse_env_text(text: str) -> dict[str, str]:
             value = value[1:-1]
         values[key.strip()] = value
     return values
+
+
+_ACTIVE_HOURS_SHAPE = re.compile(r"^\s*(\d{1,2})\s*-\s*(\d{1,2})\s*$")
+
+
+def parse_active_hours(raw: str | None) -> tuple[int, int]:
+    """
+    `"7-23"` → `(7, 23)`: inclusive Kigali hours. Unset or blank → all day.
+
+    ANYTHING ELSE IS ALL DAY AND ONE WARNING, quoting the text. Not a refusal: the
+    hours only decide when we knock, and taking a working collector off the air
+    over a typo would cost the kitchen more than the typo does. Not a guess at
+    what was meant either — all day is the one answer that never hides an order.
+    """
+    if raw is None or not raw.strip():
+        return ACTIVE_HOURS_DEFAULT
+    shape = _ACTIVE_HOURS_SHAPE.match(raw)
+    if shape:
+        start, end = int(shape.group(1)), int(shape.group(2))
+        if 0 <= start <= 23 and 0 <= end <= 23:
+            return (start, end)
+    LOG.warning(
+        "%s=%r is not two Kigali hours like 7-23 — working all day instead",
+        ACTIVE_HOURS_ENV,
+        raw,
+    )
+    return ACTIVE_HOURS_DEFAULT
+
+
+def _in_active_hours(hour: int, hours: tuple[int, int]) -> bool:
+    """Both ends inclusive; a window whose start is after its end wraps midnight."""
+    start, end = hours
+    if start <= end:
+        return start <= hour <= end
+    return hour >= start or hour <= end
+
+
+def describe_active_hours(hours: tuple[int, int]) -> str:
+    """`"all day"`, or `"07:00–23:00 Kigali"` — the words of the one line at start."""
+    if all(_in_active_hours(h, hours) for h in range(24)):
+        return "all day"
+    return f"{hours[0]:02d}:00–{hours[1]:02d}:00 Kigali"
 
 
 def load_config(path: Path = DEFAULT_ENV_FILE) -> Config:
@@ -704,6 +766,13 @@ def load_config(path: Path = DEFAULT_ENV_FILE) -> Config:
     if deadman_enabled and raw_deadman and raw_deadman not in ("1", "true", "yes", "on"):
         LOG.warning("DEADMAN=%r is not a yes or a no — the deadman stays ARMED (DEADMAN=0 disables it)", raw_deadman)
 
+    # THE HOURS, PARSED ONCE, HERE. The environment beats the file so one run can
+    # be told otherwise by hand; neither means all day (24-hour service).
+    raw_hours = os.environ.get(ACTIVE_HOURS_ENV, "")
+    if not raw_hours.strip():
+        raw_hours = values.get(ACTIVE_HOURS_ENV, "")
+    active_hours = parse_active_hours(raw_hours)
+
     return Config(
         username=values["VUBAVUBA_USERNAME"],
         password=values["VUBAVUBA_PASSWORD"],
@@ -713,6 +782,7 @@ def load_config(path: Path = DEFAULT_ENV_FILE) -> Config:
         portal_base=(values.get("VUBAVUBA_BASE_URL") or PORTAL_BASE).rstrip("/"),
         watch_poll_seconds=poll_seconds,
         deadman_enabled=deadman_enabled,
+        active_hours=active_hours,
     )
 
 
@@ -1181,8 +1251,10 @@ def summary_says_empty(soup: BeautifulSoup) -> bool:
     THE BUG THIS EXISTS FOR. On a day with no sales the page drops the table
     entirely — there is no header row to assert, so `assert_headers` called it
     "no table with a header row on the page" and the run exited 4, PORTAL DRIFT,
-    complete with a dump for somebody to read. The collector runs from 07:00; a
-    restaurant has sold nothing at 07:00 most mornings. That is a drift alarm
+    complete with a dump for somebody to read. The collector's first run of a day
+    used to be at 07:00; a
+    restaurant has sold nothing at 07:00 most mornings (and, since 24-hour
+    service, nothing yet at 00:00 on a new day). That is a drift alarm
     fired by an ordinary quiet hour, and an alarm that cries wolf every morning is
     an alarm nobody reads on the day the columns really do move.
 
@@ -2224,6 +2296,41 @@ def kigali_now() -> datetime:
     return datetime.now(timezone.utc).astimezone(KIGALI)
 
 
+#: The one door the date comes through, and the one variable that can hold it open.
+#:
+#: TWO THINGS here are decided by "today" and by nothing else: the window a run
+#: reads (`window_for`) and the floor the ref cache is pruned to
+#: (`save_known_refs`). Both used to call the clock themselves, which is how a
+#: suite written against August fixtures passed in August and failed in September
+#: for a reason that had nothing to do with the code. Now `main` resolves the day
+#: ONCE and carries it as a value: a run whose window came from one day and whose
+#: prune floor came from another is exactly the inconsistency this prevents.
+#:
+#: UNSET IS THE NORMAL CASE — launchd, Actions and the phone all leave it unset,
+#: get `None`, and read the real Kigali clock wherever a day is needed, which is
+#: what lets a watch loop follow the day across midnight. A date that will not
+#: parse is refused loudly: a typo that silently fell back to the real clock
+#: would be a wrong window nobody could see.
+COLLECTOR_TODAY_ENV = "COLLECTOR_TODAY"
+
+
+def resolve_today(explicit: date | None = None) -> date | None:
+    """
+    The day this run believes it is, or `None` for "ask the real clock each time".
+
+    An explicit date beats the environment; the environment beats nothing at all.
+    """
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(COLLECTOR_TODAY_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError as err:
+        raise ConfigError(f"{COLLECTOR_TODAY_ENV}={raw!r} is not a YYYY-MM-DD date ({err})") from err
+
+
 def window_for(args: argparse.Namespace, cfg: Config, today: date) -> tuple[date, date]:
     if args.full:
         return HISTORY_START, today
@@ -2301,9 +2408,12 @@ def capture_fixtures(
         )
 
 
-def run(cfg: Config, args: argparse.Namespace, portal: Portal | None = None) -> Summary:
+def run(cfg: Config, args: argparse.Namespace, portal: Portal | None = None, today: date | None = None) -> Summary:
     summary = Summary()
-    today = kigali_now().date()
+    # ONE reading of the day for the whole run — the window below and the ref
+    # cache's prune floor at the end of it MUST agree, or a run started at 23:59
+    # remembers refs for a window it never read. `None` means the real clock.
+    today = today if today is not None else kigali_now().date()
     start, end = window_for(args, cfg, today)
     LOG.info("window %s .. %s (Kigali)", start, end)
 
@@ -2444,27 +2554,30 @@ def poll_digest(payload: Any) -> str:
     return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
 
 
-def seconds_until_active(now: datetime | None = None) -> float:
+def seconds_until_active(now: datetime | None = None, hours: tuple[int, int] | None = None) -> float:
     """
-    How long until 07:00 Kigali — `0.0` if the restaurant is open right now.
+    How long until the next active hour starts — `0.0` if this one is active.
 
-    The one-shot answers "the restaurant is shut" by exiting 0 and letting
-    launchd call again in two hours. A daemon cannot do that: exiting is how it
-    stops existing. So the night is a sleep, and this is the arithmetic behind
-    it. `ACTIVE_HOUR_TO` is inclusive — hour 23 is open, because 23:40 is a
-    perfectly ordinary time for the last delivery of the evening to be paid for.
+    With the default (`ACTIVE_HOURS_DEFAULT`, all day — the restaurant trades 24
+    hours) that is always `0.0`: there is no night to wait out. Only somebody who
+    SETS `COLLECTOR_ACTIVE_HOURS` gets a gap, and then the one-shot answers "not
+    now" by exiting 0 and letting launchd call again, while a daemon — which
+    cannot exit, exiting is how it stops existing — sleeps, and this is the
+    arithmetic behind that sleep. Both ends are inclusive: `7-23` keeps hour 23
+    open, because 23:40 is an ordinary time for an evening delivery to be paid for.
     """
     now = now or kigali_now()
-    if ACTIVE_HOUR_FROM <= now.hour <= ACTIVE_HOUR_TO:
+    hours = hours if hours is not None else ACTIVE_HOURS_DEFAULT
+    if _in_active_hours(now.hour, hours):
         return 0.0
-    opening = now.replace(hour=ACTIVE_HOUR_FROM, minute=0, second=0, microsecond=0)
+    opening = now.replace(hour=hours[0], minute=0, second=0, microsecond=0)
     if opening <= now:
         opening += timedelta(days=1)
     return (opening - now).total_seconds()
 
 
 def _duration(seconds: float) -> str:
-    """`27000.0` → `"7h 30m"`. For the one line a human reads at 23:00."""
+    """`27000.0` → `"7h 30m"`. For the one line a human reads when a gap starts."""
     if seconds < 60:
         return f"{int(seconds)}s"
     minutes = int(seconds // 60)
@@ -2755,14 +2868,14 @@ def _watch_sleep(seconds: float, stop: WatchStop, sleeper: Any) -> None:
     Sleep, in pieces, so a signal is answered in seconds rather than at dawn.
 
     PEP 475 made `time.sleep` RESUME after a signal handler returns, which is
-    almost always what you want and is exactly wrong here: `_watch_sleep(27000)`
-    through the night would take the SIGTERM, set the flag, and then go back to
-    sleep for another seven hours with nobody left to notice. Chopping the wait
+    almost always what you want and is exactly wrong here: a `_watch_sleep(27000)`
+    outside a set `COLLECTOR_ACTIVE_HOURS` would take the SIGTERM, set the flag,
+    and then go back to sleep for another seven hours with nobody left to notice. Chopping the wait
     into `WATCH_SLEEP_CHUNK` pieces bounds how long the flag can go unread.
 
     Each piece also BEATS THE DEADMAN, because a deliberate wait is not a hang: a
-    five-minute backoff against a portal that is down, and the seven-hour sleep
-    through the night, are both this loop working exactly as designed. What the
+    five-minute backoff against a portal that is down, and a long sleep outside
+    hours somebody set, are both this loop working exactly as designed. What the
     deadman is looking for is a wait nobody chose.
     """
     remaining = float(seconds)
@@ -2816,6 +2929,7 @@ def watch(
     sleeper: Any = time.sleep,
     stop: WatchStop | None = None,
     deadman: Deadman | None = None,
+    today: date | None = None,
 ) -> int:
     """
     Log in once; re-read the recent window every ~10s; import only what changed.
@@ -2902,12 +3016,9 @@ def watch(
     since_sweep = WATCH_SWEEP_SECONDS
 
     LOG.info(
-        "watch mode: one login, then %s every %.0fs; active %02d:00-%02d:59 Kigali. "
-        "SIGINT or SIGTERM stops it.",
+        "watch mode: one login, then %s every %.0fs. SIGINT or SIGTERM stops it.",
         ORDERS_API_PATH,
         poll_seconds,
-        ACTIVE_HOUR_FROM,
-        ACTIVE_HOUR_TO,
     )
     # WHICH COPY OF THIS FILE IS ACTUALLY RUNNING. Its own line, because it is the
     # one thing a person standing at the phone after a hand update needs to read
@@ -2946,18 +3057,21 @@ def watch(
         )
     try:
         while not stop:
-            shut_for = seconds_until_active()
-            if shut_for > 0:
-                # ONE line for the whole night, not one per poll. The alternative is
-                # 4,000 lines of "closed" between midnight and seven, which is how
-                # the morning's real messages become unfindable.
+            # With the default hours (all day — 24-hour service) this is always
+            # zero and the branch below never runs. It exists for whoever SETS
+            # `COLLECTOR_ACTIVE_HOURS`.
+            idle_for = seconds_until_active(hours=cfg.active_hours)
+            if idle_for > 0:
+                # ONE line for the whole gap, not one per poll. The alternative is
+                # thousands of lines of "not now", which is how the morning's real
+                # messages become unfindable.
                 LOG.info(
-                    "the restaurant is shut — sleeping %s, until %02d:00 Kigali",
-                    _duration(shut_for),
-                    ACTIVE_HOUR_FROM,
+                    "outside the active hours — sleeping %s, until %02d:00 Kigali",
+                    _duration(idle_for),
+                    cfg.active_hours[0],
                 )
-                _watch_sleep(shut_for, stop, sleeper)
-                # Nothing that happened before the night is worth carrying past it:
+                _watch_sleep(idle_for, stop, sleeper)
+                # Nothing that happened before the gap is worth carrying past it:
                 # open with a complete read and a fresh hour on the heartbeat.
                 since_sweep = WATCH_SWEEP_SECONDS
                 since_heartbeat = 0.0
@@ -2973,7 +3087,10 @@ def watch(
                     portal.login()
                     logged_in = True
 
-                start, end = window_for(args, cfg, kigali_now().date())
+                # `today` is None in every ordinary run, so the day is re-read on
+                # every poll and this loop follows the Kigali midnight. A fixed
+                # day is only ever an operator replaying one window on purpose.
+                start, end = window_for(args, cfg, today if today is not None else kigali_now().date())
                 payload = portal.get_json(ORDERS_API_PATH, orders_params(1, start, end))
                 polls += 1
                 # A COMPLETED POLL IS THE LOOP'S OWN PULSE — the beat the deadman
@@ -3004,7 +3121,7 @@ def watch(
                     # mean a drifted portal re-reading, re-failing and re-dumping on
                     # every single poll, because the sweep would never come due.
                     since_sweep = 0.0
-                    summary = run(cfg, args, portal)
+                    summary = run(cfg, args, portal, today=today)
                     LOG.info("%s", summary.line())
                     digest = fresh
 
@@ -3070,7 +3187,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--full", action="store_true", help=f"backfill from {HISTORY_START} (implies --force)")
     parser.add_argument("--start", help="window start, YYYY-MM-DD (with --end)")
     parser.add_argument("--end", help="window end, YYYY-MM-DD (with --start)")
-    parser.add_argument("--force", action="store_true", help="run even outside 07:00-23:00 Kigali")
+    parser.add_argument("--force", action="store_true", help=f"run even outside {ACTIVE_HOURS_ENV} (default: all day)")
     parser.add_argument(
         "--watch",
         action="store_true",
@@ -3083,7 +3200,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, today: date | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     global _state_dir
@@ -3095,12 +3212,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     setup_logging(args.state_dir)
     try:
         cfg = load_config(args.env_file)
+        # THE DAY, RESOLVED ONCE, HERE. Everything below carries the value; nothing
+        # below asks the environment again. `None` is the ordinary answer and means
+        # "the real Kigali clock, wherever a day is needed".
+        today = resolve_today(today)
     except CollectorError as err:
         LOG.error("%s", err)
         return err.exit_code
 
     # Re-established now that the secrets are known, so nothing below can leak them.
     setup_logging(args.state_dir, cfg.secrets, args.verbose)
+
+    # ONE line, at start, naming the hours in force — for the one-shot and the
+    # watch alike. It replaces the old per-night "the restaurant is shut" line:
+    # with 24-hour service there is no night, and whoever set hours reads them here.
+    LOG.info("active hours: %s", describe_active_hours(cfg.active_hours))
 
     if bool(args.start) != bool(args.end):
         LOG.error("--start and --end must be given together")
@@ -3132,7 +3258,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 previous.pop(sig, None)
                 LOG.debug("could not install a handler for %s", sig)
         try:
-            return watch(cfg, args, stop=stop)
+            return watch(cfg, args, stop=stop, today=today)
         except CollectorError as err:
             LOG.error("%s", err)
             return err.exit_code
@@ -3147,16 +3273,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     pass
 
     hour = kigali_now().hour
-    if not (args.force or args.full or args.dry_run) and not (ACTIVE_HOUR_FROM <= hour <= ACTIVE_HOUR_TO):
-        # Not an error, and deliberately not a failure code: launchd fires this
-        # every two hours around the clock and the restaurant is shut. A run that
+    if not (args.force or args.full or args.dry_run) and not _in_active_hours(hour, cfg.active_hours):
+        # Only reachable when somebody SET `COLLECTOR_ACTIVE_HOURS` — the default
+        # is all day. Not an error, and deliberately not a failure code: a run that
         # reported failure here would train everybody to ignore the exit status.
-        LOG.info("night skip: %02d:00 Kigali is outside %02d:00-%02d:00", hour, ACTIVE_HOUR_FROM, ACTIVE_HOUR_TO)
+        LOG.info("outside the active hours at %02d:00 Kigali — nothing to do", hour)
         return EXIT_OK
 
     summary = Summary()
     try:
-        summary = run(cfg, args)
+        summary = run(cfg, args, today=today)
     except CollectorError as err:
         summary.exit_code = err.exit_code
         LOG.error("%s", err)
