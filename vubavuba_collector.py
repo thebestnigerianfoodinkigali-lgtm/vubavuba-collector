@@ -80,6 +80,22 @@ was about to resume perfectly. A silence past the limit is now an OBSERVATION: t
 verdict comes a grace later, and a loop that moved in between was frozen, not
 hung. `DEADMAN=0` in the credentials file is the escape hatch under that.
 
+AND SINCE 2026-09-28 IT PRESSES TWO BUTTONS FOR THE SHOP (VV-2, ADR-130). THE
+WORKER DECIDES, THE PHONE ACTS. The owner said yes to the app pressing Accept on
+every new VubaVuba order and Ready for pickup when the cooks tap ✅ Ready. The
+Worker cannot reach the portal, so it keeps the to-do list and hands it out on
+the heartbeat's answer (`{ok, at, actions:[…]}`); this program presses each one
+with the portal's own form (`POST api/order_handler.php`, `action=update_status`,
+the order id the Worker sent, `status=accepted` or `ready for pickup`,
+`remarks=resto-ledger`) on the session it already holds, one per second, and
+reports what the portal answered to `/api/imports/vubavuba/actions/<id>/result`.
+There is NO switch here: the owner's switch is on the ledger, and an action
+exists in this program only because a heartbeat answer carried it. A refusal is
+reported and never retried in the same beat — the Worker counts, and after three
+asks a person. `watch` presses after each fourth poll's beat; a one-shot beats
+once at the end of a run that worked and drains the list. Every beat says who is
+beating (`by`: `phone`, or `github` when `COLLECTOR_RUNNER=github`).
+
 WHAT THIS PROGRAM PROMISES
 
   * It never guesses. Money that does not parse, a row whose column count
@@ -503,6 +519,56 @@ WATCH_PING_EVERY_N_POLLS = 4
 #: stand between a customer's order and the kitchen. See `ping_ledger`.
 WATCH_PING_TIMEOUT = 5.0
 
+# ---------------------------------------------------------------------------
+# VV-2 (ADR-130): pressing Accept and Ready for pickup — the Worker decides, the phone acts
+# ---------------------------------------------------------------------------
+
+#: WHO IS BEATING. The heartbeat body says `by`, and the Worker refuses a beat
+#: whose `by` is anything but these two words (HTTP 400, BEFORE the liveness
+#: stamp) — so this program never sends anything else. `watch` is always the
+#: phone; a one-shot says what `COLLECTOR_RUNNER` says (environment first, then
+#: the credentials file, default phone). The GitHub backstop is meant to set
+#: `COLLECTOR_RUNNER=github`; until its workflow does, it beats as the phone,
+#: which is also the Worker's default for a collector that says nothing.
+RUNNER_ENV = "COLLECTOR_RUNNER"
+RUNNER_PHONE = "phone"
+RUNNER_GITHUB = "github"
+RUNNERS = (RUNNER_PHONE, RUNNER_GITHUB)
+
+#: Where the phone says what the portal answered: `{by, ok, http?, message?}`
+#: under the collector token. The Worker counts the attempts (three refusals ask
+#: a person) and closes a row only when a LATER IMPORT shows the status — never
+#: on this report's word.
+ACTION_RESULT_PATH = "/api/imports/vubavuba/actions/{id}/result"
+
+#: The portal's own write, captured 28 Sep from its page code (plan section K):
+#: `POST api/order_handler.php` — the same file the Details button reads with a
+#: GET — with exactly `action=update_status`, `order_id`, `status`, `remarks`.
+ORDER_UPDATE_ACTION = "update_status"
+
+#: The free-text `remarks` field, so a person reading the order's history on the
+#: portal can tell the app pressed it and not somebody at the counter.
+ACTION_REMARKS = "resto-ledger"
+
+#: The two things the ledger can ask for, and the portal's literal status word
+#: for each (lower case, with spaces, exactly as its filter lists them). An
+#: action whose `status_value` is not EXACTLY this pair's other half is refused
+#: as malformed: this program presses what was clearly meant, or nothing.
+ACTION_STATUS_VALUE = {"accept": "accepted", "ready": "ready for pickup"}
+
+#: The shape of an action id and an order id: 1–64 letters, digits, `_` or `-`.
+#: The action id becomes a PATH SEGMENT of the report URL, so this is also what
+#: stops a stray `../` from walking the report somewhere else.
+_ACTION_ID_SHAPE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+#: How much of the portal's message (or an exception's text) rides the report.
+ACTION_MESSAGE_CHARS = 200
+
+#: The report's one try. Short for the ping's reason: a slow ledger must never
+#: stand between the next poll and the kitchen, and a report that does not land
+#: is re-handed by the Worker a minute later (`REPICK_AFTER_MS`).
+ACTION_REPORT_TIMEOUT = 10.0
+
 #: HOW MANY CHARACTERS OF THIS FILE'S FINGERPRINT THE PING CARRIES.
 #:
 #: THE FAILURE IT MAKES VISIBLE. The collector on the S5 is updated BY HAND:
@@ -612,6 +678,9 @@ class Config:
     #: Inclusive Kigali hours `(from, to)` in which to work. All day unless
     #: `COLLECTOR_ACTIVE_HOURS` says otherwise — see `ACTIVE_HOURS_DEFAULT`.
     active_hours: tuple[int, int] = ACTIVE_HOURS_DEFAULT
+    #: VV-2: who a ONE-SHOT says is beating (`COLLECTOR_RUNNER`). `watch` is
+    #: always the phone and ignores this.
+    runner: str = RUNNER_PHONE
 
     @property
     def secrets(self) -> tuple[str, ...]:
@@ -681,6 +750,23 @@ def describe_active_hours(hours: tuple[int, int]) -> str:
     if all(_in_active_hours(h, hours) for h in range(24)):
         return "all day"
     return f"{hours[0]:02d}:00–{hours[1]:02d}:00 Kigali"
+
+
+def parse_runner(raw: str | None) -> str:
+    """
+    `COLLECTOR_RUNNER` → `"phone"` or `"github"`. Unset or blank → phone.
+
+    ANYTHING ELSE IS THE PHONE AND ONE WARNING. The Worker refuses a beat with any
+    other `by` before it stamps the liveness, so sending the typo would silence
+    this collector's heartbeat; the phone is the Worker's own default.
+    """
+    value = (raw or "").strip().lower()
+    if not value:
+        return RUNNER_PHONE
+    if value in RUNNERS:
+        return value
+    LOG.warning("%s=%r is not phone or github — beating as phone", RUNNER_ENV, raw)
+    return RUNNER_PHONE
 
 
 def load_config(path: Path = DEFAULT_ENV_FILE) -> Config:
@@ -773,6 +859,13 @@ def load_config(path: Path = DEFAULT_ENV_FILE) -> Config:
         raw_hours = values.get(ACTIVE_HOURS_ENV, "")
     active_hours = parse_active_hours(raw_hours)
 
+    # WHO A ONE-SHOT SAYS IT IS (VV-2). The environment beats the file, exactly as
+    # the hours do, so the GitHub workflow can say `github` in one line.
+    raw_runner = os.environ.get(RUNNER_ENV, "")
+    if not raw_runner.strip():
+        raw_runner = values.get(RUNNER_ENV, "")
+    runner = parse_runner(raw_runner)
+
     return Config(
         username=values["VUBAVUBA_USERNAME"],
         password=values["VUBAVUBA_PASSWORD"],
@@ -783,12 +876,21 @@ def load_config(path: Path = DEFAULT_ENV_FILE) -> Config:
         watch_poll_seconds=poll_seconds,
         deadman_enabled=deadman_enabled,
         active_hours=active_hours,
+        runner=runner,
     )
 
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+
+
+def redact(text: str, secrets: Sequence[str]) -> str:
+    """Every secret of four characters or more replaced with `***` — the filter's rule, callable."""
+    for secret in secrets:
+        if secret and len(secret) >= 4 and secret in text:
+            text = text.replace(secret, "***")
+    return text
 
 
 class RedactingFilter(logging.Filter):
@@ -820,10 +922,7 @@ class RedactingFilter(logging.Filter):
             message = record.getMessage()
         except Exception:  # pragma: no cover - a broken format string is not our business
             return True
-        redacted = message
-        for secret in self._secrets:
-            if secret in redacted:
-                redacted = redacted.replace(secret, "***")
+        redacted = redact(message, self._secrets)
         if redacted != message:
             record.msg = redacted
             record.args = ()
@@ -1444,6 +1543,24 @@ class Portal:
         # what the next page LOOKS like (`looks_like_login`), because the portal
         # expires sessions server-side and a boolean here could only ever record
         # what was true a moment ago.
+
+    def post_form(self, path: str, fields: dict[str, str]) -> requests.Response:
+        """
+        POST a form on THIS session, asking for JSON. VV-2's one write; see `press_action`.
+
+        Through the same throttle as every read — one portal request a second is
+        the rule for writes too — and a network failure is `PortalUnreachable`, as
+        for a GET. The body is urlencoded; PHP reads it into the same `$_POST` the
+        page's own `FormData` fills. The cookie rides the session and is never logged.
+        """
+        self.throttle.wait()
+        url = f"{self.cfg.portal_base}{path}"
+        LOG.debug("POST %s action=%s order_id=%s status=%s", url, fields.get("action"),
+                  fields.get("order_id"), fields.get("status"))
+        try:
+            return self.session.post(url, data=fields, headers={"Accept": "application/json"}, timeout=60)
+        except requests.RequestException as err:
+            raise PortalUnreachable(f"POST {path}: {type(err).__name__}: {err}") from err
 
     def get_authenticated(self, path: str, params: dict[str, Any] | None = None) -> requests.Response:
         """GET, and if that lands on the login form, log in once and GET again."""
@@ -2205,7 +2322,89 @@ def post_json(
     raise ApiError(f"POST {path} failed after {attempts} attempts — {last}")
 
 
-def ping_ledger(cfg: Config, at: str | None = None) -> bool:
+@dataclass(frozen=True)
+class PortalAction:
+    """One row the ledger wants pressed on the portal (ADR-130). Every field is the Worker's."""
+
+    id: str
+    order_id: str
+    ref_no: str | None
+    action: str
+    status_value: str
+
+
+@dataclass(frozen=True)
+class Beat:
+    """What a heartbeat came back with. Truthy exactly when the ledger heard it."""
+
+    ok: bool
+    actions: tuple = ()
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def _action_problem(item: Any) -> str | None:
+    """Why one entry of `actions` is not something to press, or None when it is."""
+    if not isinstance(item, dict):
+        return f"an entry is {type(item).__name__}, not an object"
+    action_id, order_id = item.get("id"), item.get("order_id")
+    if not isinstance(action_id, str) or not _ACTION_ID_SHAPE.match(action_id):
+        return f"id {action_id!r} is not 1-64 letters, digits, _ or -"
+    if not isinstance(order_id, str) or not _ACTION_ID_SHAPE.match(order_id):
+        return f"order_id {order_id!r} of {action_id} is not 1-64 letters, digits, _ or -"
+    ref_no = item.get("ref_no")
+    if ref_no is not None and not isinstance(ref_no, str):
+        return f"ref_no {ref_no!r} of {action_id} is not text"
+    kind = item.get("action")
+    if kind not in ACTION_STATUS_VALUE:
+        return f"action {kind!r} of {action_id} is not accept or ready"
+    if item.get("status_value") != ACTION_STATUS_VALUE[kind]:
+        return (f"status_value {item.get('status_value')!r} of {action_id} is not "
+                f"{ACTION_STATUS_VALUE[kind]!r}, the only word {kind} can mean")
+    return None
+
+
+def parse_heartbeat_actions(body: Any) -> tuple[list[PortalAction], list[str]]:
+    """
+    The heartbeat answer → `(the actions to press, what was wrong with the rest)`.
+
+    ABSENT OR EMPTY IS NOTHING, silently: a Worker before VV-1 answers `{ok, at}`,
+    and an empty list is the ordinary quiet case. Anything malformed — `actions`
+    not a list, an entry missing a field, an action this build does not know, a
+    status word that is not EXACTLY the one its action means, an id that is not a
+    plain token — is LEFT OUT and named, and the caller logs one WARNING for the
+    beat. The good entries beside a bad one still count. Nothing here guesses:
+    pressing a button on somebody else's website is only done when it was clearly
+    meant.
+    """
+    if not isinstance(body, dict):
+        return [], [f"the answer is {type(body).__name__}, not an object"]
+    raw = body.get("actions")
+    if raw is None:
+        return [], []
+    if not isinstance(raw, list):
+        return [], [f"actions is {type(raw).__name__}, not a list"]
+    actions: list[PortalAction] = []
+    problems: list[str] = []
+    for item in raw:
+        problem = _action_problem(item)
+        if problem is not None:
+            problems.append(problem)
+            continue
+        actions.append(
+            PortalAction(
+                id=item["id"],
+                order_id=item["order_id"],
+                ref_no=item.get("ref_no"),
+                action=item["action"],
+                status_value=item["status_value"],
+            )
+        )
+    return actions, problems
+
+
+def ping_ledger(cfg: Config, at: str | None = None, by: str = RUNNER_PHONE) -> Beat:
     """
     Tell the ledger this phone is still watching. ONE try, five seconds, no retry.
 
@@ -2228,11 +2427,20 @@ def ping_ledger(cfg: Config, at: str | None = None) -> bool:
     has ever heard from — the half-finished hand update this whole field exists
     for. It rides the ping rather than getting a call of its own because it costs
     eight characters on a request that was already going.
+
+    `by` (VV-2) SAYS WHO IS BEATING — `"phone"` or `"github"`, and nothing else is
+    ever sent, because the Worker refuses any other value BEFORE it stamps the
+    beat. And the answer now carries the phone's WORK: `actions`, the Accept /
+    Ready-for-pickup rows the Worker wants pressed (`parse_heartbeat_actions`).
+    The result is a `Beat`, which is truthy exactly when the ping landed, so
+    everything that only asked "did it land?" reads it as before.
     """
     url = f"{cfg.api_base}{HEARTBEAT_PATH}"
     body = {
         "at": at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "v": COLLECTOR_VERSION,
+        # NEVER anything but the two words: the Worker refuses the beat otherwise.
+        "by": by if by in RUNNERS else RUNNER_PHONE,
     }
     headers = {
         "Content-Type": "application/json",
@@ -2246,11 +2454,184 @@ def ping_ledger(cfg: Config, at: str | None = None) -> bool:
         response = requests.post(url, json=body, headers=headers, timeout=WATCH_PING_TIMEOUT)
     except requests.RequestException as err:
         LOG.debug("liveness ping did not reach %s — %s: %s", url, type(err).__name__, err)
+        return Beat(False)
+    if not 200 <= response.status_code < 300:
+        LOG.debug("liveness ping → HTTP %d", response.status_code)
+        return Beat(False)
+    try:
+        answer: Any = response.json()
+    except ValueError:
+        answer = None
+        problems = ["the answer is not JSON"]
+        actions: list[PortalAction] = []
+    else:
+        actions, problems = parse_heartbeat_actions(answer)
+    if problems:
+        # ONE line per beat, whatever was wrong and however much of it.
+        LOG.warning(
+            "the ledger's heartbeat answer had %d action(s) this collector will not press: %s",
+            len(problems),
+            "; ".join(problems)[:600],
+        )
+    return Beat(True, tuple(actions))
+
+
+@dataclass(frozen=True)
+class ActionOutcome:
+    """What the portal answered one press: the report's `ok`, `http` and `message`."""
+
+    ok: bool
+    http: int | None
+    message: str
+
+
+def _wire_message(text: Any, portal: Portal) -> str:
+    """Text fit to send to the ledger: secrets and the session cookie redacted, one line, ≤200 chars."""
+    secrets = list(portal.cfg.secrets)
+    try:
+        secrets.extend(cookie.value for cookie in portal.session.cookies if cookie.value)
+    except Exception:  # noqa: BLE001 - a cookie jar we cannot walk still redacts the secrets
+        pass
+    return collapse(redact(str(text or ""), secrets))[:ACTION_MESSAGE_CHARS]
+
+
+def press_action(portal: Portal, action: PortalAction) -> ActionOutcome:
+    """
+    Press ONE button on the portal, exactly as its own page does. **Never raises.**
+
+    `POST api/order_handler.php`, form fields `action=update_status`,
+    `order_id=<the id the Worker sent>`, `status=<its literal word>`,
+    `remarks=resto-ledger`, `Accept: application/json`, on THIS session. The
+    portal answers `{success, message}`; only a real `true` is a success.
+
+    A 401 / session-expired answer logs in ONCE and presses ONCE more — the same
+    rule every read has. Anything that stops the press — a refusal, a second
+    expiry, a page that is not JSON, a network error — is an `ok=False` outcome
+    with the portal's message or the exception's text, for the report to carry.
+    Nothing here retries a refusal: the Worker counts attempts and, after three,
+    asks a person.
+    """
+    fields = {
+        "action": ORDER_UPDATE_ACTION,
+        "order_id": action.order_id,
+        "status": action.status_value,
+        "remarks": ACTION_REMARKS,
+    }
+    try:
+        response = portal.post_form(ORDER_DETAILS_PATH, fields)
+        if api_session_expired(response):
+            LOG.info("session expired or absent — re-authenticating before pressing %s", action.action)
+            portal.login()
+            response = portal.post_form(ORDER_DETAILS_PATH, fields)
+    except Exception as err:  # noqa: BLE001 - a press that failed is a report, never a crash
+        return ActionOutcome(False, None, _wire_message(f"{type(err).__name__}: {err}", portal))
+
+    status = response.status_code
+    try:
+        answer = response.json()
+    except ValueError:
+        answer = None
+    if not isinstance(answer, dict):
+        return ActionOutcome(False, status, _wire_message(
+            f"the portal answered HTTP {status} with something that is not a JSON object", portal))
+    message = answer.get("message")
+    text = _wire_message(message if isinstance(message, str) else "", portal)
+    if api_session_expired(response):
+        return ActionOutcome(False, status, text or "the session was still expired after one re-login")
+    ok = answer.get("success") is True and 200 <= status < 300
+    return ActionOutcome(ok, status, text)
+
+
+def report_action_result(cfg: Config, action_id: str, by: str, outcome: ActionOutcome) -> bool:
+    """
+    Tell the ledger what the portal answered. ONE try, never raises, never retried.
+
+    A report that does not get out is a WARNING and nothing more: the Worker hands
+    the row out again a minute later, and the next import shows the status anyway —
+    which, not this report, is what closes the row.
+    """
+    url = f"{cfg.api_base}{ACTION_RESULT_PATH.format(id=action_id)}"
+    body: dict[str, Any] = {"by": by if by in RUNNERS else RUNNER_PHONE, "ok": bool(outcome.ok)}
+    if outcome.http is not None:
+        body["http"] = int(outcome.http)
+    if outcome.message:
+        body["message"] = outcome.message
+    headers = {
+        "Content-Type": "application/json",
+        "X-Requested-With": "fetch",
+        "X-Collector-Token": cfg.collector_token,
+        "User-Agent": USER_AGENT,
+    }
+    beat()
+    try:
+        response = requests.post(url, json=body, headers=headers, timeout=ACTION_REPORT_TIMEOUT)
+    except Exception as err:  # noqa: BLE001 - a lost report is a log line
+        LOG.warning("could not report action %s to the ledger (%s: %s) — it will be handed out again",
+                    action_id, type(err).__name__, err)
         return False
     if 200 <= response.status_code < 300:
         return True
-    LOG.debug("liveness ping → HTTP %d", response.status_code)
+    LOG.warning("could not report action %s — the ledger answered HTTP %d: %s",
+                action_id, response.status_code, (response.text or "")[:200])
     return False
+
+
+def perform_actions(portal: Portal, cfg: Config, actions: Sequence[PortalAction], by: str) -> int:
+    """
+    Press what the ledger handed out, in order, and report each. Returns how many the portal took.
+
+    **THE WORKER DECIDES, THE PHONE ACTS.** There is no switch in this program:
+    the owner's switch lives on the ledger, and an action exists here only because
+    a heartbeat answer carried it. One press per action id per call — a row that
+    appears twice is pressed once, and a refusal is reported, never retried here.
+    One portal request a second, through the session's own throttle. **Never
+    raises**: this runs inside the watch loop, below the orders.
+    """
+    pressed = 0
+    seen: set = set()
+    try:
+        for action in actions:
+            if action.id in seen:
+                continue
+            seen.add(action.id)
+            try:
+                outcome = press_action(portal, action)
+            except Exception as err:  # noqa: BLE001 - press_action does not raise; this is the promise
+                outcome = ActionOutcome(False, None, _wire_message(f"{type(err).__name__}: {err}", portal))
+            if outcome.ok:
+                pressed += 1
+            LOG.info(
+                "action %s #%s → %s",
+                action.action,
+                action.ref_no or action.order_id,
+                "success" if outcome.ok else f"refused: {outcome.message or 'no message'}",
+            )
+            report_action_result(cfg, action.id, by, outcome)
+    except Exception as err:  # noqa: BLE001 - the loop that imports orders outlives this
+        LOG.error("pressing the ledger's actions failed (%s: %s) — they will be handed out again",
+                  type(err).__name__, err)
+    return pressed
+
+
+def drain_actions(cfg: Config, portal: Portal, by: str) -> int:
+    """
+    The one-shot's last errand (VV-2): beat ONCE as `by`, press what comes back, report.
+
+    Never raises and never changes the run's exit code: a beat that does not land
+    is a log line, and the rows wait for the phone or the next run.
+    """
+    try:
+        answer = ping_ledger(cfg, by=by)
+    except Exception as err:  # noqa: BLE001 - the run's exit code is the imports', not this
+        LOG.warning("the end-of-run heartbeat raised (%s: %s) — no actions this run", type(err).__name__, err)
+        return 0
+    if not answer.ok:
+        LOG.info("the end-of-run heartbeat did not reach the ledger — no actions this run")
+        return 0
+    if not answer.actions:
+        return 0
+    LOG.info("the ledger handed out %d action(s) to press", len(answer.actions))
+    return perform_actions(portal, cfg, list(answer.actions), by=by)
 
 
 # ---------------------------------------------------------------------------
@@ -2886,7 +3267,7 @@ def _watch_sleep(seconds: float, stop: WatchStop, sleeper: Any) -> None:
         remaining -= nap
 
 
-def _pinged(cfg: Config, streak: int) -> int:
+def _pinged(cfg: Config, streak: int, actions_out: list | None = None) -> int:
     """
     Ping the ledger; say how long the failing streak is now. **NEVER RAISES.**
 
@@ -2902,9 +3283,16 @@ def _pinged(cfg: Config, streak: int) -> int:
     first failure says so, the rest are silent, and the recovery says how many
     there were — which is also the only line that tells a reader whether the
     counter was being told this phone had stopped.
+
+    `actions_out` (VV-2) collects what the beat handed out for the caller to press
+    AFTER this returns — pressing is not this function's job, and keeping it out
+    keeps the promise above.
     """
     try:
-        ok = ping_ledger(cfg)
+        answer = ping_ledger(cfg)
+        ok = bool(answer)
+        if actions_out is not None:
+            actions_out.extend(getattr(answer, "actions", ()) or ())
     except Exception as err:  # noqa: BLE001 - an order must never be lost to a ping
         LOG.debug("the liveness ping raised (%s: %s) — ignored", type(err).__name__, err)
         ok = False
@@ -3102,8 +3490,9 @@ def watch(
                 # by construction: `_pinged` returns rather than raising, so a
                 # ledger that cannot be reached costs a log line and never a
                 # backoff, a re-login or one order's delay. See `ping_ledger`.
+                due_actions: list = []
                 if polls % WATCH_PING_EVERY_N_POLLS == 0:
-                    ping_streak = _pinged(cfg, ping_streak)
+                    ping_streak = _pinged(cfg, ping_streak, due_actions)
 
                 fresh = poll_digest(payload)
                 changed = fresh != digest
@@ -3124,6 +3513,13 @@ def watch(
                     summary = run(cfg, args, portal, today=today)
                     LOG.info("%s", summary.line())
                     digest = fresh
+
+                # VV-2: WHAT THE BEAT HANDED OUT, PRESSED AFTER THE IMPORT — the
+                # orders reach the kitchen first, and a press costs a second each.
+                # Always the phone, on this loop's one session. `perform_actions`
+                # never raises, so nothing here can cost a backoff or a re-login.
+                if due_actions:
+                    perform_actions(portal, cfg, due_actions, by=RUNNER_PHONE)
 
                 failures = 0
                 backoff = WATCH_BACKOFF_START
@@ -3281,14 +3677,25 @@ def main(argv: Sequence[str] | None = None, today: date | None = None) -> int:
         return EXIT_OK
 
     summary = Summary()
+    # ONE session for the run AND the presses after it (VV-2): the actions ride the
+    # cookie the scrape already holds, never a second login.
+    portal = Portal(cfg)
     try:
-        summary = run(cfg, args, today=today)
+        summary = run(cfg, args, portal=portal, today=today)
     except CollectorError as err:
         summary.exit_code = err.exit_code
         LOG.error("%s", err)
     except Exception as err:  # noqa: BLE001 - the last line of defence; it is logged and coded
         summary.exit_code = EXIT_UNEXPECTED
         LOG.exception("unexpected failure: %s", err)
+
+    # VV-2: THE LAST ERRAND — beat once as `COLLECTOR_RUNNER` says, press what the
+    # ledger hands out, report each. Only after a run that worked (a portal this
+    # run could not read is not one to press buttons on; the rows wait for the
+    # phone or the next run) and never on a dry run, which posts nothing. It
+    # cannot change the exit code.
+    if summary.exit_code == EXIT_OK and not args.dry_run:
+        drain_actions(cfg, portal, cfg.runner)
 
     # ONE summary line, always, whatever happened. It is what `tail collector.log`
     # is for, and what makes "is this thing working" answerable in one glance.

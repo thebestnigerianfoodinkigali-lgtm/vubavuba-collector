@@ -38,6 +38,39 @@ unreadable means all day, and every start logs `active hours: …`. The reasonin
 about logins is unchanged: one login per watch session, then one read every
 five seconds on it.
 
+## Pressing Accept and Ready for the shop
+
+**The Worker decides, the phone acts.** (VV-2, 2026-09-28.) The owner said yes
+to the app pressing **Accept** on every new VubaVuba order and **Ready for
+pickup** when the cooks tap ✅ Ready. The ledger keeps the to-do list and the
+owner's on/off switch; the collector has **no switch of its own** and presses
+only what the ledger hands it:
+
+* Every heartbeat says who is beating — `by` is `phone` or `github`, never
+  anything else (the ledger refuses other values) — and the answer may carry
+  `actions`. None, or an empty list, is nothing; anything malformed is skipped
+  with one WARNING.
+* Each action is the portal's own form on the session the collector already
+  holds: `POST api/order_handler.php` with `action=update_status`, the
+  `order_id` the ledger sent, `status=accepted` or `status=ready for pickup`,
+  `remarks=resto-ledger`, `Accept: application/json`. One per second; a 401 logs
+  in once and tries once more; a refusal is reported and never retried in the
+  same beat (the ledger asks a person after three).
+* The answer is reported to the ledger (`/api/imports/vubavuba/actions/<id>/result`,
+  `{by, ok, http, message}`, message ≤200 characters with secrets redacted); a
+  report that cannot get out is logged and the ledger re-hands the row a minute
+  later.
+* One log line per action: `action accept #<ref> → success` or
+  `→ refused: <message>`. The cookie and the credentials are never logged.
+
+The phone's `--watch` presses after each fourth poll's beat, as `phone`. The
+Actions one-shot beats once **at the end** of a run that worked, presses,
+reports and exits as before. **`COLLECTOR_RUNNER=phone|github`** (environment
+first, then the credentials file; default `phone`) says who a one-shot is. The
+Actions workflow should set `COLLECTOR_RUNNER: github` in its `env:`; it has not
+been edited yet, so until then the backstop beats as `phone`, which the ledger
+also accepts.
+
 The collector itself (`vubavuba_collector.py`) is a byte-identical copy of
 `resto-ledger/collector/vubavuba_collector.py` — fix bugs there first, then copy
 the file here unchanged (resto-ledger's `collector/tests/test_sync.py` compares
