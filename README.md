@@ -1,5 +1,23 @@
 # Vubavuba collector
 
+> ## ⚠ RETIRED WHEN THE BOOKS READ FOR THEMSELVES (R11, ADR-132, 29 Sep 2026)
+>
+> The VubaVuba reader now lives inside the ledger's own Worker: it logs in once,
+> reads the orders every 5 seconds and presses Accept / Ready for pickup itself.
+> VubaVuba allows ONE login at a time, so this runner must never log in while the
+> books read. Every run — the phone's watch (`phone.py`), the GitHub one-shot
+> (`.github/workflows/collect.yml`), a hand-run — asks the ledger first
+> (`GET /api/imports/vubavuba/status`) and, on `{"reader": "worker"}`, logs ONE line
+> (*the books read for themselves now — this runner is retired*) and exits 0 without
+> logging in. A watch loop whose heartbeat is refused with 409 `reader_retired` stops
+> the same way, and `phone.py` does not restart a clean exit.
+>
+> **The GitHub workflow is left in place but is retired**: once the owner switches the
+> books' reader on, each scheduled run exits 0 at that first question. Until then the
+> ledger answers `"reader": "phone"` and this repo works exactly as before.
+> `vubavuba_collector.py` stays byte-identical to `resto-ledger/collector/vubavuba_collector.py`.
+
+
 Scrapes the merchant portal (merchant.vubavuba.rw) every ~5 minutes via GitHub
 Actions and POSTs normalized orders to the resto-ledger Worker, which books
 them and — in auto mode — pushes today's new orders to the kitchen's Telegram

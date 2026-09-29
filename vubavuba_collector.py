@@ -535,6 +535,25 @@ RUNNER_PHONE = "phone"
 RUNNER_GITHUB = "github"
 RUNNERS = (RUNNER_PHONE, RUNNER_GITHUB)
 
+#: ── R11 (ADR-132) ── WHO READS VUBAVUBA. Since the reader moved into the Worker
+#: (`worker/do/vuba-reader.ts`), the ledger can read the portal for itself, and
+#: VubaVuba allows ONE login at a time: a second reader kicks the first. So every
+#: run of this program — the phone's watch, the GitHub one-shot, a hand-run on a
+#: laptop, a dry run — asks the ledger FIRST, before it logs in, and when the answer
+#: is `{"reader": "worker"}` it logs ONE line and exits 0 without touching the
+#: portal. Exit 0 is what makes it stay stopped: the phone's `phone.py` treats a
+#: clean exit as "stopped on request" and does not restart.
+#:
+#: ANY OTHER ANSWER IS "KEEP READING" — a ledger from before R11 (404), an
+#: unreachable one, a body that is not JSON. Refusing to run on a ledger that
+#: merely failed to answer would stop the orders; the heartbeat's 409 below is the
+#: second net for a runner that started while the question could not be asked.
+READER_STATUS_PATH = "/api/imports/vubavuba/status"
+READER_STATUS_TIMEOUT = 10.0
+READER_RETIRED_LOG = "the books read for themselves now — this runner is retired"
+#: The heartbeat's refusal when the books read for themselves (HTTP 409, this `error`).
+READER_RETIRED_ERROR = "reader_retired"
+
 #: Where the phone says what the portal answered: `{by, ok, http?, message?}`
 #: under the collector token. The Worker counts the attempts (three refusals ask
 #: a person) and closes a row only when a LATER IMPORT shows the status — never
@@ -2370,6 +2389,9 @@ class Beat:
 
     ok: bool
     actions: tuple = ()
+    #: ── R11 ── the ledger refused the beat because it reads VubaVuba for itself
+    #: (HTTP 409 `reader_retired`): this runner must stop, for good, with exit 0.
+    retired: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -2496,6 +2518,14 @@ def ping_ledger(cfg: Config, at: str | None = None, by: str = RUNNER_PHONE) -> B
     except requests.RequestException as err:
         LOG.debug("liveness ping did not reach %s — %s: %s", url, type(err).__name__, err)
         return Beat(False)
+    if response.status_code == 409:
+        # ── R11 (ADR-132) ── the books read for themselves: this runner is retired.
+        try:
+            refusal: Any = response.json()
+        except ValueError:
+            refusal = None
+        if isinstance(refusal, dict) and refusal.get("error") == READER_RETIRED_ERROR:
+            return Beat(False, (), retired=True)
     if not 200 <= response.status_code < 300:
         LOG.debug("liveness ping → HTTP %d", response.status_code)
         return Beat(False)
@@ -2655,6 +2685,36 @@ def perform_actions(portal: Portal, cfg: Config, actions: Sequence[PortalAction]
     return pressed
 
 
+def ledger_reads_itself(cfg: Config) -> bool:
+    """
+    ── R11 (ADR-132) ── Does the ledger read VubaVuba for itself? **NEVER RAISES.**
+
+    `GET /api/imports/vubavuba/status` under the collector token, ten seconds, one
+    try. True ONLY for an explicit `{"reader": "worker"}` — every failure (a ledger
+    from before R11, no network, not JSON) is False, "keep reading as before",
+    because a runner that stopped whenever the ledger was slow to answer would be
+    an outage of its own. See `READER_STATUS_PATH`.
+    """
+    url = f"{cfg.api_base}{READER_STATUS_PATH}"
+    headers = {
+        "X-Requested-With": "fetch",
+        "X-Collector-Token": cfg.collector_token,
+        "User-Agent": USER_AGENT,
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=READER_STATUS_TIMEOUT)
+    except Exception as err:  # noqa: BLE001 - an unanswered question is "keep reading"
+        LOG.debug("could not ask the ledger who reads (%s: %s) — reading as before", type(err).__name__, err)
+        return False
+    if response.status_code != 200:
+        return False
+    try:
+        body: Any = response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("reader") == "worker"
+
+
 def drain_actions(cfg: Config, portal: Portal, by: str) -> int:
     """
     The one-shot's last errand (VV-2): beat ONCE as `by`, press what comes back, report.
@@ -2666,6 +2726,9 @@ def drain_actions(cfg: Config, portal: Portal, by: str) -> int:
         answer = ping_ledger(cfg, by=by)
     except Exception as err:  # noqa: BLE001 - the run's exit code is the imports', not this
         LOG.warning("the end-of-run heartbeat raised (%s: %s) — no actions this run", type(err).__name__, err)
+        return 0
+    if getattr(answer, "retired", False):
+        LOG.info("%s", READER_RETIRED_LOG)
         return 0
     if not answer.ok:
         LOG.info("the end-of-run heartbeat did not reach the ledger — no actions this run")
@@ -3309,7 +3372,7 @@ def _watch_sleep(seconds: float, stop: WatchStop, sleeper: Any) -> None:
         remaining -= nap
 
 
-def _pinged(cfg: Config, streak: int, actions_out: list | None = None) -> int:
+def _pinged(cfg: Config, streak: int, actions_out: list | None = None, retired_out: list | None = None) -> int:
     """
     Ping the ledger; say how long the failing streak is now. **NEVER RAISES.**
 
@@ -3329,12 +3392,17 @@ def _pinged(cfg: Config, streak: int, actions_out: list | None = None) -> int:
     `actions_out` (VV-2) collects what the beat handed out for the caller to press
     AFTER this returns — pressing is not this function's job, and keeping it out
     keeps the promise above.
+
+    `retired_out` (R11) gets one `True` when the ledger refused the beat because it
+    reads VubaVuba for itself; the watch loop then stops, for good, with exit 0.
     """
     try:
         answer = ping_ledger(cfg)
         ok = bool(answer)
         if actions_out is not None:
             actions_out.extend(getattr(answer, "actions", ()) or ())
+        if retired_out is not None and getattr(answer, "retired", False):
+            retired_out.append(True)
     except Exception as err:  # noqa: BLE001 - an order must never be lost to a ping
         LOG.debug("the liveness ping raised (%s: %s) — ignored", type(err).__name__, err)
         ok = False
@@ -3533,8 +3601,13 @@ def watch(
                 # ledger that cannot be reached costs a log line and never a
                 # backoff, a re-login or one order's delay. See `ping_ledger`.
                 due_actions: list = []
+                retired_now: list = []
                 if polls % WATCH_PING_EVERY_N_POLLS == 0:
-                    ping_streak = _pinged(cfg, ping_streak, due_actions)
+                    ping_streak = _pinged(cfg, ping_streak, due_actions, retired_now)
+                if retired_now:
+                    # ── R11 (ADR-132) ── the books read for themselves: stop, for good.
+                    LOG.info("%s", READER_RETIRED_LOG)
+                    return EXIT_OK
 
                 fresh = poll_digest(payload)
                 changed = fresh != digest
@@ -3665,6 +3738,12 @@ def main(argv: Sequence[str] | None = None, today: date | None = None) -> int:
     # watch alike. It replaces the old per-night "the restaurant is shut" line:
     # with 24-hour service there is no night, and whoever set hours reads them here.
     LOG.info("active hours: %s", describe_active_hours(cfg.active_hours))
+
+    # ── R11 (ADR-132) ── ASK FIRST, BEFORE ANY LOGIN: when the books read VubaVuba for
+    # themselves this runner is retired — one line, exit 0, the portal never touched.
+    if ledger_reads_itself(cfg):
+        LOG.info("%s", READER_RETIRED_LOG)
+        return EXIT_OK
 
     if bool(args.start) != bool(args.end):
         LOG.error("--start and --end must be given together")
